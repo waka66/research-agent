@@ -7,7 +7,20 @@ authors = [
     { name = "wangkai", email = "15281818813@163.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "fastapi>=0.141.1",
+    "langchain>=1.4.3",
+    "langchain-openai>=1.6.6",
+    "langgraph>=1.2.12",
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "psycopg[binary]>=3.3.6",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
+    "tavily-python>=0.8.4",
+    "trafilatura>=2.2.0",
+    "uvicorn[standard]>=0.54.0",
+]
 
 [project.scripts]
 research-agent = "research_agent:main"
