@@ -1,3 +1,7 @@
+from dotenv import load_dotenv
+load_dotenv()
+
+
 from langchain_openai import ChatOpenAI
 
 from research_agent.config import settings

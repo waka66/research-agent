@@ -25,17 +25,19 @@ async def web_search_tool(query: str) -> dict:
     )
     result_list = []
     # 提取核心字段，规整输出
+    max_length = 1500
     for item in response.get("results", []):
+        content = lambda item, max_length: item.get("content")[:max_length] if item.get("content") else ""
         result_list.append({
             "title": item.get("title"),
-            "summary": item.get("content"),
-            "url": item.get("url")
+            "summary": content(item, max_length),
+            "url": item.get("url"),
+            "id": item.get("id")
         })
     return {
         "success": True,
         "query": query,
         "search_result": result_list,
-        "ai_short_answer": response.get("answer")
     }
 
 

@@ -3,6 +3,7 @@ from langgraph.types import Send
 
 
 
+
 from research_agent.llm import llm
 from research_agent.graph.state import ResearchState
 from research_agent.schemas.research import ResearchPlan, ResearchReport, ResearcherInput
@@ -17,7 +18,7 @@ async def Planner(state: ResearchState):
     planner_model = llm.with_structured_output(
         ResearchPlan,
         method="function_calling",
-        # include_raw=True,    # 调试用的，保留原始输出
+        include_raw=True,    # 调试用的，保留原始输出
     )
 
     plan: ResearchPlan =await planner_model.ainvoke(
@@ -40,12 +41,15 @@ async def Planner(state: ResearchState):
                 """)
         ] + state["question"]
     )
-    #print("----------plan-----------")
-    #print(plan)
+    print("----------plan-----------")
+    print(plan)
+
+    research_plan = plan['parsed']
+
 
     # 把 Pydantic 对象序列化成 JSON 字符串，再放进 AIMessage
     return {
-        "research_plan": plan,
+        "research_plan": research_plan,
         "status": "running"
     }
 
@@ -57,7 +61,7 @@ def dispatch_research_tasks(state: ResearchState):
             "research_node",
             {"task": task}
         )
-        for task in state["research_plan"].tasks
+        for task in state["research_plan"].tasks[:1]
     ]
 
 
@@ -65,12 +69,11 @@ async def research_node(state: ResearcherInput):
 
     worker_result = await worker_graph.ainvoke({
         "task": state["task"],
-        "messages": [],
-        "result": None,
-        "search_calls": 0,
+        "research_history": [],
     })
-    #print("----------result-----------")
-    #print(worker_result["result"])
+    print("----------result-----------")
+    print(worker_result)
+
 
     return {
         "research_results": [
@@ -83,7 +86,8 @@ async def research_node(state: ResearcherInput):
 async def Synthesizer(state: ResearchState):
     synthesizer_model = llm.with_structured_output(
         ResearchReport,
-        method="function_calling"
+        method="function_calling",
+        include_raw=True
     )
     result: ResearchReport = await synthesizer_model.ainvoke(
         [
@@ -96,8 +100,11 @@ async def Synthesizer(state: ResearchState):
             HumanMessage(content=f"研究计划：{state['research_plan']}\n研究结果：{state['research_results']}")
         ]
     )
+    print("----------report-----------")
+    print(result)
+    report = result['parsed']
     return {
-        "report": result,
+        "report": report,
         "status": "running"
     }
 
@@ -114,6 +121,8 @@ async def generator(state: ResearchState):
             HumanMessage(content=f"综合报告：{state['report']}")
         ]
     )
+    print("----------final_answer-----------")
+    print(result)
     return {
         "final_answer": result,
         "status": "completed"

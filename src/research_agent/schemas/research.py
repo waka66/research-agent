@@ -70,3 +70,14 @@ class ResearchReport(BaseModel):
     summary: str
     sections: list[ReportSection]
     claims: list[ReportClaim]
+
+
+
+class ResearchDecision(BaseModel):
+    key_facts: list[str]
+    covered_topics: list[str]
+    missing_topics: list[str]
+
+    sufficient: bool = Field(default=False)
+    next_query: str | None
+    irrelevant_ids: list[str]

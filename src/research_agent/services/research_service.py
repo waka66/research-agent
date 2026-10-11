@@ -29,6 +29,8 @@ async def run_research(agent, run_id: UUID, question: str, queue: asyncio.Queue)
             handler = handlers.get(node_name)
             data = chunk[node_name]
             await queue.put((handler,data))
+        # result = await agent.ainvoke({"question": question, "status": "completed"}, config=config)
+        # print("RESULT:", result)
     except asyncio.CancelledError:
         await queue.put(("cancelled", None))
         raise
