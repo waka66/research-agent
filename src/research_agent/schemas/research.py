@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from uuid import UUID
 from langchain.messages import AnyMessage
 from langgraph.graph import add_messages
-from typing_extensions import TypedDict
+from typing_extensions import TypedDict, Literal
 
 
 
@@ -41,43 +41,54 @@ class ResearchPlan(BaseModel):
 class ResearcherInput(TypedDict):
     task: ResearchTask
 
-class ResearchResult(BaseModel):
-    task_id: str
-    summary: str
-    sources: list[str]
 
-
+class ResearchFindingDraft(BaseModel):
+    checklist_item_id: str
+    claim: str
+    quote: str
+    source_id: str
+    stance: Literal["supports", "contradicts", "context"]  #正，反
+class ResearchResultDraft(BaseModel):
+    findings: list[ResearchFindingDraft]
 
 class ResearchFinding(BaseModel):
-    claim: str
-    evidence: str
-    source_url: str
+    id: str
+    checklist_item_id: str    # 回答 research_plan 里的哪一项
+    claim: str   #一句话的原子断言,不含代词,主体、时间、数值、范围都写全
+    quote: str   #原文的逐字摘录,1 到 2 句,自身完整(含主语、数字、时间限定)
+    source_id: str
+    stance: Literal["supports", "contradicts", "context"]
 class ResearchResult(BaseModel):
     task_id: str
-    summary: str
     findings: list[ResearchFinding]
+    item_status: dict[str, Literal["answered", "partial", "missing"]]
 
 
 
-class ReportSection(BaseModel):
-    title: str
-    content: str
-class ReportClaim(BaseModel):
-    claim: str
-    citation_ids: list[str]
+class Point(BaseModel):
+    text: str
+    finding_ids: list[str] = []
+    kind: Literal["fact", "inference", "transition"]
+    importance: Literal["key", "supporting"] = "supporting"
+class Section(BaseModel):
+    heading: str
+    points: list[Point]
 class ResearchReport(BaseModel):
     title: str
-    summary: str
-    sections: list[ReportSection]
-    claims: list[ReportClaim]
-
+    key_conclusions: list[Point]
+    sections: list[Section]
 
 
 class ResearchDecision(BaseModel):
     key_facts: list[str]
-    covered_topics: list[str]
     missing_topics: list[str]
 
     sufficient: bool = Field(default=False)
     next_query: str | None
     irrelevant_ids: list[str]
+
+class ResearchWorkerPlan(BaseModel):
+    TaskList: list[str]
+    query: str
+
+

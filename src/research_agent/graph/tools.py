@@ -21,7 +21,7 @@ async def web_search_tool(query: str) -> dict:
     # 官方标准调用，深度高级检索
     response =await client.search(
         query=query,
-        search_depth="advanced"
+        search_depth="advanced"  #advanced  两倍消耗，basic普通
     )
     result_list = []
     # 提取核心字段，规整输出

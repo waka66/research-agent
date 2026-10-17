@@ -25,9 +25,15 @@ class ResearchState(TypedDict):
 class ResearchWorkerState(TypedDict):
     task: ResearchTask
     current_search_query: str | None
+    TaskList: list[str]
+
     result: ResearchResult
+    error_result: str | None
     search_result: list[str]
+
     filtered_search_results: Annotated[list[str], operator.add]
+
     search_calls: int
     error_calls: int
+
     research_history: Annotated[list[ResearchDecision], operator.add]

@@ -4,7 +4,7 @@ from langgraph.types import Send
 
 
 
-from research_agent.llm import llm
+from research_agent.llm import llm, llm2
 from research_agent.graph.state import ResearchState
 from research_agent.schemas.research import ResearchPlan, ResearchReport, ResearcherInput
 from research_agent.graph.worker_workflow import worker_graph
@@ -61,7 +61,7 @@ def dispatch_research_tasks(state: ResearchState):
             "research_node",
             {"task": task}
         )
-        for task in state["research_plan"].tasks[:1]
+        for task in state["research_plan"].tasks
     ]
 
 
@@ -78,13 +78,12 @@ async def research_node(state: ResearcherInput):
     return {
         "research_results": [
             worker_result["result"]
-        ],
-        "status": "running"
+        ]
     }
 
 
 async def Synthesizer(state: ResearchState):
-    synthesizer_model = llm.with_structured_output(
+    synthesizer_model = llm2.with_structured_output(
         ResearchReport,
         method="function_calling",
         include_raw=True
@@ -104,8 +103,7 @@ async def Synthesizer(state: ResearchState):
     print(result)
     report = result['parsed']
     return {
-        "report": report,
-        "status": "running"
+        "report": report
     }
 
 
