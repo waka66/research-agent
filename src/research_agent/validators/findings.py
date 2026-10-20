@@ -1,7 +1,8 @@
 import logging
 import re
+import hashlib
 
-from research_agent.schemas.research import ResearchFindingDraft
+from research_agent.schemas.research import Finding, Source
 
 logger = logging.getLogger(__name__)
 
@@ -49,55 +50,70 @@ def _normalize(text: str) -> str:
     return "".join(text.split()).lower()
 
 
-def validate_findings(
-    findings: list[ResearchFindingDraft],
-    sources: list[dict],
-) -> list[ResearchFindingDraft]:
-    """
-    校验 LLM 生成的 findings，任意一条规则不满足就整条丢弃。
 
-    规则：
-    1. source_id 必须存在于 sources 里
-    2. quote 必须能在 source_id 对应的原文里找到（严格或宽松）
-    3. claim 里的数字/英文术语/代码标识符必须出现在 quote 里
-    """
-    source_map = {
-        s["id"]: s.get("summary") or ""
-        for s in sources
-        if s.get("id")
-    }
 
-    valid: list[ResearchFindingDraft] = []
 
-    for f in findings:
-        # ---- 规则 1：source_id 存在 ----
-        if f.source_id not in source_map:
-            logger.warning(
-                "丢弃（source_id 不存在）: source_id=%s claim=%s",
-                f.source_id, f.claim[:50],
-            )
+#---------------------------------------
+MIN_QUOTE_CHARS = 8
+MAX_QUOTE_CHARS = 400       # 1~2 句原文不该超过这个长度；超了说明它在偷懒复制整段
+def finding_id(source_id: str, quote: str) -> str:
+    """稳定 id：同一来源里的同一句话，任何一轮抽出来都是同一个 id → 天然跨轮去重。"""
+    return hashlib.sha1(f"{source_id}|{_normalize(quote)}".encode("utf-8")).hexdigest()[:12]#将证据ID+格式化的原文拼一起用hash生成ID，一共40位只取前12位
+
+
+def validate_extract(
+    raw_findings: list,                      # 动态生成的 RawFinding，无法静态标注类型
+    sources: dict[str, Source],              # 本轮 new_results：id -> Source
+    open_ids: set[str],
+) -> tuple[list[Finding], list[str]]:
+    """把 LLM 的抽取结果变成账本。返回 (通过的 findings, 丢弃原因)。"""
+    accepted: list[Finding] = []
+    dropped: list[str] = []
+    seen: set[str] = set()
+
+    for r in raw_findings:
+        pids = list(dict.fromkeys(getattr(r, "point_ids", []) or []))
+        if not pids:
+            dropped.append("point_ids 为空")
+            continue
+        bad = [p for p in pids if p not in open_ids]
+        if bad:
+            dropped.append(f"point_ids 不在开放清单里 {bad}")
             continue
 
-        original = source_map[f.source_id]
-
-        # ---- 规则 2：quote 在原文里 ----
-        if f.quote not in original and _normalize(f.quote) not in _normalize(original):
-            logger.warning(
-                "丢弃（quote 不在原文）: source_id=%s quote=%s",
-                f.source_id, f.quote[:80],
-            )
+        src = sources.get(getattr(r, "result_id", None))
+        if src is None:
+            dropped.append(f"result_id 不在本轮新结果里 {getattr(r, 'result_id', None)}")
             continue
 
-        # ---- 规则 3：claim 的硬信息必须在 quote 里 ----
-        hard_tokens = _extract_hard_tokens(f.claim)
-        missing = [t for t in hard_tokens if not _quote_contains_token(f.quote, t)]
+        quote = (r.quote or "").strip()
+        if len(quote) < MIN_QUOTE_CHARS:
+            dropped.append(f"quote 太短 {quote!r}")
+            continue
+        if len(quote) > MAX_QUOTE_CHARS:
+            dropped.append(f"quote 太长（{len(quote)} 字），疑似整段复制")
+            continue
+
+        original = src.summary or ""
+        if quote not in original and _normalize(quote) not in _normalize(original):
+            dropped.append(f"quote 不在原文: {quote[:40]}")
+            continue
+
+        hard = _extract_hard_tokens(r.claim or "")
+        missing = [t for t in hard if not _quote_contains_token(quote, t)]
         if missing:
-            logger.warning(
-                "丢弃（claim 硬信息不在 quote）: source_id=%s missing=%s claim=%s",
-                f.source_id, missing, f.claim[:60],
-            )
+            dropped.append(f"claim 的硬信息不在 quote {missing}: {(r.claim or '')[:40]}")
             continue
 
-        valid.append(f)
+        fid = finding_id(src.id, quote)
+        if fid in seen:
+            dropped.append(f"本轮重复：{quote[:30]}")
+            continue
+        seen.add(fid)
 
-    return valid
+        accepted.append(
+            Finding(id=fid, point_ids=pids, claim=(r.claim or "").strip(),
+                    quote=quote, source_id=src.id, stance=r.stance)
+        )
+
+    return accepted, dropped

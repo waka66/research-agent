@@ -1,46 +1,53 @@
+import os
+
 from langchain.tools import tool
 from tavily import AsyncTavilyClient
 
-import os
-
-from research_agent.llm import llm
-
-
-
-
-
+from research_agent.graph import cache
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 client = AsyncTavilyClient(TAVILY_API_KEY)
-@tool
-async def web_search_tool(query: str) -> dict:
-    """联网搜索互联网公开信息，返回标准化标题、摘要、来源URL
-    Args:
-        query: 搜索关键词/问题
-    """
-    # 官方标准调用，深度高级检索
-    response =await client.search(
-        query=query,
-        search_depth="advanced"  #advanced  两倍消耗，basic普通
-    )
-    result_list = []
-    # 提取核心字段，规整输出
-    max_length = 1500
-    for item in response.get("results", []):
-        content = lambda item, max_length: item.get("content")[:max_length] if item.get("content") else ""
-        result_list.append({
-            "title": item.get("title"),
-            "summary": content(item, max_length),
-            "url": item.get("url"),
-            "id": item.get("id")
-        })
+
+SEARCH_DEPTH = os.getenv("TAVILY_DEPTH", "basic")
+MAX_RESULTS = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
+MAX_CONTENT = 1500
+
+# 影响结果的参数全部进缓存命名空间：改了配置，旧缓存自动失效
+CACHE_NS = f"{SEARCH_DEPTH}-{MAX_RESULTS}-{MAX_CONTENT}"
+
+
+def _normalize(query: str, raw: dict) -> dict:
     return {
         "success": True,
         "query": query,
-        "search_result": result_list,
+        "search_result": [
+            {
+                "title": item.get("title") or "",
+                "summary": (item.get("content") or "")[:MAX_CONTENT],
+                "url": item.get("url") or "",
+                "id": item.get("id"),
+            }
+            for item in raw.get("results", [])
+        ],
     }
 
 
-tools = [web_search_tool]
-tools_by_name = {tool.name: tool for tool in tools}
-model_with_tools = llm.bind_tools(tools)
+@tool
+async def web_search_tool(query: str) -> dict:
+    """联网搜索互联网公开信息，返回标准化标题、摘要、来源URL"""
+    cached = cache.get(query, CACHE_NS)
+    if cached is not None:
+        print(f"  [cache] hit: {query[:50]}")
+        return cached
+
+    if cache.OFFLINE:
+        raise RuntimeError(f"离线模式且缓存未命中：{query}")
+
+    raw = await client.search(
+        query=query,
+        search_depth=SEARCH_DEPTH,
+        max_results=MAX_RESULTS,
+    )
+    payload = _normalize(query, raw)
+    cache.put(query, payload, CACHE_NS)
+    return payload
