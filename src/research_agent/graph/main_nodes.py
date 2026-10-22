@@ -1,9 +1,10 @@
 from langchain.messages import HumanMessage, ToolMessage, AnyMessage, SystemMessage
 from langgraph.types import Send
 import asyncio
+import logging
 
 from research_agent.graph.error import WorkerFatalError
-from research_agent.graph.main_prompt import SYNTH_SYSTEM_PROMPT
+from research_agent.graph.main_prompt import (PLANNER_SYSTEM_PROMPT, SYNTH_SYSTEM_PROMPT)
 from research_agent.graph.render import render_report
 from research_agent.llm import llm, llm_synth
 from research_agent.graph.state import ResearchState
@@ -11,9 +12,14 @@ from research_agent.schemas.research import ResearchPlan, ResearchReport, Resear
 from research_agent.graph.worker_workflow import worker_graph
 from research_agent.validators.report import validate_report
 
-
+logger = logging.getLogger("research_agent/graph/main_nodes.py")
 
 async def Planner(state: ResearchState):
+    """
+    整个research-agent的主计划节点，
+    主要任务是拿到用户的问题，把问题拆分多个可独立执行的研究任务
+    返回任务列表
+    """
     planner_model = llm.with_structured_output(
         ResearchPlan,
         method="function_calling",
@@ -22,39 +28,27 @@ async def Planner(state: ResearchState):
 
     plan: ResearchPlan =await planner_model.ainvoke(
         [
-            SystemMessage(content="""
-                你是 Research Agent 的 Planner 节点。
-
-                你的职责：
-                1. 分析用户的研究问题
-                2. 将问题拆分为多个可独立执行的研究任务--为了控制成本，如果任务简单请尽量少拆，或者直接不拆直接返回一个任务
-                3. 每个任务必须能够通过搜索和资料分析独立完成
-                4. 任务之间尽量不存在依赖关系，以便系统并行执行
-                5. 不负责最终总结
-                6. 不创建“综合以上任务”“形成最终报告”之类的任务
-                7. 不进行网页搜索
-                8. 不向用户询问确认
-                9. task的id以T1,T2,T3...的形式编号
-
-                只输出研究任务计划。
-                """)
-        ] + state["question"]
+            SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+            HumanMessage(content=state["question"])
+        ]
     )
-    print("----------plan-----------")
-    print(plan)
+
+    logger.info(
+        "Planner成功运行"
+    )
 
     research_plan = plan['parsed']
 
-
-    # 把 Pydantic 对象序列化成 JSON 字符串，再放进 AIMessage
     return {
         "research_plan": research_plan,
         "status": "running"
     }
 
 
-
 def dispatch_research_tasks(state: ResearchState):
+    """
+    分发主节点的任务给子节点，让子节点并行运行
+    """
     return [
         Send(
             "research_node",
@@ -65,7 +59,11 @@ def dispatch_research_tasks(state: ResearchState):
 
 
 async def research_node(state: ResearcherInput):
-
+    """
+    subgraph的入口
+    把拿到任务发给subgraph
+    获得最终结果
+    """
     worker_result = await worker_graph.ainvoke({
         "task": state["task"],
         "points": {}, "findings": {}, "sources": {},
@@ -74,9 +72,10 @@ async def research_node(state: ResearcherInput):
         "new_results": [], "round_findings": [],
         "search_calls": 0, "error_calls": 0,
     })
-    print("----------result-----------")
-    print(worker_result)
 
+    logger.info(
+        f"拿到{state["task"].id}的结果，research_node成功"
+    )
 
     return {
         "research_results": [

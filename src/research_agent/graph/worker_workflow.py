@@ -5,12 +5,16 @@ from research_agent.graph.state import ResearchWorkerState
 from research_agent.graph.worker_nodes import research_plan, search_node, research_results, extract_node, update_node, plan_next
 
 
-def route_after_update(state) -> Literal["plan_next", "research_results"]:
-    """终止权在这里。只看代码写进去的 stop_now，不看任何 LLM 字段。"""
+def route_after_update(state: ResearchWorkerState) -> Literal["plan_next", "research_results"]:
+    """终止裁决。
+
+    只读 stop_now（由 update_node 根据 should_stop 写入），
+    不读任何 LLM 产出字段——避免模型"自己决定停"。
+    """
     return "research_results" if state.get("stop_now") else "plan_next"
 
 
-def route_after_plan_next(state) -> Literal["search_node", "research_results"]:
+def route_after_plan_next(state: ResearchWorkerState) -> Literal["search_node", "research_results"]:
     """plan_next 自己放弃时直接收尾，不再空跑一轮。"""
     return "research_results" if state.get("stop_now") else "search_node"
 

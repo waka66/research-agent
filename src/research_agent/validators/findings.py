@@ -13,7 +13,6 @@ _TOKEN_PATTERN = re.compile(r"""
     |
     [A-Za-z][A-Za-z0-9_]*    # 英文标识符，如 supports_ttl、PutOp、TTL
 """, re.VERBOSE)
-
 # 常见英文虚词，不参与校验（claim 是英文时避免误杀）
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for",
@@ -22,8 +21,6 @@ _STOPWORDS = {
     "as", "by", "with", "from", "into", "via",
     "if", "then", "else", "when", "while",
 }
-
-
 def _extract_hard_tokens(text: str) -> set[str]:
     """从 claim 里提取必须出现在 quote 里的硬信息"""
     tokens: set[str] = set()
@@ -48,14 +45,10 @@ def _quote_contains_token(quote: str, token: str) -> bool:
 def _normalize(text: str) -> str:
     """去空白 + 转小写，用于宽容匹配"""
     return "".join(text.split()).lower()
-
-
-
-
-
 #---------------------------------------
-MIN_QUOTE_CHARS = 8
-MAX_QUOTE_CHARS = 400       # 1~2 句原文不该超过这个长度；超了说明它在偷懒复制整段
+#校验extract_node的finding
+MIN_QUOTE_CHARS = 8         #finding的quote最短长度
+MAX_QUOTE_CHARS = 400       #finding的quote最长长度
 def finding_id(source_id: str, quote: str) -> str:
     """稳定 id：同一来源里的同一句话，任何一轮抽出来都是同一个 id → 天然跨轮去重。"""
     return hashlib.sha1(f"{source_id}|{_normalize(quote)}".encode("utf-8")).hexdigest()[:12]#将证据ID+格式化的原文拼一起用hash生成ID，一共40位只取前12位
@@ -63,8 +56,8 @@ def finding_id(source_id: str, quote: str) -> str:
 
 def validate_extract(
     raw_findings: list,                      # 动态生成的 RawFinding，无法静态标注类型
-    sources: dict[str, Source],              # 本轮 new_results：id -> Source
-    open_ids: set[str],
+    sources: dict[str, Source],              # 本轮 new_results：id -> Source，清单ID和搜索结果ID组成的字典
+    open_ids: set[str],                      #目前开放的点
 ) -> tuple[list[Finding], list[str]]:
     """把 LLM 的抽取结果变成账本。返回 (通过的 findings, 丢弃原因)。"""
     accepted: list[Finding] = []
@@ -72,7 +65,7 @@ def validate_extract(
     seen: set[str] = set()
 
     for r in raw_findings:
-        pids = list(dict.fromkeys(getattr(r, "point_ids", []) or []))
+        pids = list(dict.fromkeys(getattr(r, "point_ids", []) or []))   #先拿到point_ids，再合并成字典，自动去重
         if not pids:
             dropped.append("point_ids 为空")
             continue

@@ -18,13 +18,13 @@ async def run_research(agent, run_id: UUID, question: str, queue: asyncio.Queue)
                 "thread_id": str(run_id)
             }
         }
-        question = [HumanMessage(content=question)]
+
         async for chunk in agent.astream(
                 {"question": question, "status": "running"},
                 config=config,
                 stream_mode="updates",
         ):
-            print("STREAM:", chunk)
+            # print("STREAM:", chunk)
             node_name = next(iter(chunk))
             handler = handlers.get(node_name)
             data = chunk[node_name]

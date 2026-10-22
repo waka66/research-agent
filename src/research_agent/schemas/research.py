@@ -31,6 +31,7 @@ class ResearchStatusResponse(BaseModel):
 
 
 #graph相关
+#Planner，research_plan
 class ResearchTask(BaseModel):
     id: str
     question: str
@@ -39,26 +40,11 @@ class ResearchPlan(BaseModel):
     goal: str
     tasks: list[ResearchTask]
 
+#research_node
 class ResearcherInput(TypedDict):
     task: ResearchTask
 
-
-class Point(BaseModel):
-    text: str
-    finding_ids: list[str] = []
-    kind: Literal["fact", "inference", "transition"]
-    importance: Literal["key", "supporting"] = "supporting"
-class Section(BaseModel):
-    heading: str
-    points: list[Point]
-class ResearchReport(BaseModel):
-    title: str
-    key_conclusions: list[Point]
-    sections: list[Section]
-
-
-
-#research_plan节点相关的
+#research_plan
 PointKind = Literal["official_fact", "multi_source_fact", "comparison"]  #唯一来源，多个来源，
 class PlannedPoint(BaseModel):
     """LLM 眼里的"点"的唯一形态：只有文本，没有 id。
@@ -86,7 +72,8 @@ class SeedQuery(BaseModel):
 class ResearchWorkerPlan(BaseModel):
     points: list[PlannedPoint]
     queries: list[SeedQuery]
-    out_of_scope: list[str] = Field(default_factory=list)
+    out_of_scope: list[str] = Field(default_factory=list)     #超出范围的点
+
 
 #与state有关
 class PointState(BaseModel):
@@ -95,11 +82,12 @@ class PointState(BaseModel):
     kind: PointKind = "multi_source_fact"
     accepts: str = ""
     priority: Literal["key", "supporting"] = "supporting"
+    round_added: int = 0
     status: Literal["open", "done", "thin", "missing"] = "open"
+    contested: bool = False  # 证明这个点有争议
+
     misses: int = 0
     origin: Literal["plan", "discovered"] = "plan"
-    round_added: int = 0
-    contested: bool = False  #拿到过 contradicts 证据
     single_domain: bool = False
 class Query(BaseModel):
     """运行时查询：targets 已经是真实 point id。plan 落种和 plan_next 都产出它。"""
@@ -116,14 +104,6 @@ class Source(BaseModel):
     summary: str = ""             # Tavily 的 content，截断 1500 字，quote 校验的对象
 
 
-class Finding(BaseModel):
-    """固化后的证据。id 由代码生成，之后任何人不得改写这条记录的语义。"""
-    id: str
-    point_ids: list[str] = Field(min_length=1)
-    claim: str
-    quote: str
-    source_id: str
-    stance: Literal["supports", "contradicts", "context"]
 def make_extract_schema(open_ids: list[str], result_ids: list[str]):
     """extract 的 LLM 输出 schema。两个 id 空间都锁成枚举，模型无法越界。"""
     PointId = Literal[tuple(open_ids)]
@@ -137,13 +117,24 @@ def make_extract_schema(open_ids: list[str], result_ids: list[str]):
         result_id: ResultId = Field(description="quote 来自哪一条结果")
         quote: str = Field(min_length=4, description="从结果摘要里逐字复制的原文")
         claim: str = Field(min_length=4, description="quote 支持的一句原子断言")
-        stance: Literal["supports", "contradicts", "context"]
+        stance: Literal["supports", "contradicts", "context"]    #支持，反驳，补充背景
 
     class ExtractOutput(BaseModel):
         findings: list[RawFinding]
 
     return ExtractOutput
 
+class Finding(BaseModel):
+    """固化后的证据。id 由代码生成，之后任何人不得改写这条记录的语义。"""
+    id: str
+    point_ids: list[str] = Field(min_length=1)
+    claim: str
+    quote: str
+    source_id: str
+
+    stance: Literal["supports", "contradicts", "context"]
+
+#plan_next使用
 def make_next_schema(open_ids: list[str]):
     """plan_next 的输出 schema。点 id 锁成枚举——这是清单不可被改写的硬保证。"""
     PointId = Literal[tuple(open_ids)]
@@ -170,7 +161,18 @@ def make_next_schema(open_ids: list[str]):
 
     return NextStep
 
-
+class Point(BaseModel):
+    text: str
+    finding_ids: list[str] = []
+    kind: Literal["fact", "inference", "transition"]
+    importance: Literal["key", "supporting"] = "supporting"
+class Section(BaseModel):
+    heading: str
+    points: list[Point]
+class ResearchReport(BaseModel):
+    title: str
+    key_conclusions: list[Point]
+    sections: list[Section]
 class ResearchResult(BaseModel):
     task_id: str
     findings: list[Finding]

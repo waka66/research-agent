@@ -13,7 +13,7 @@ from research_agent.graph.tools import web_search_tool
 from research_agent.validators.findings import validate_extract
 from research_agent.validators.sources import norm_url, registrable_domain
 from research_agent.graph.worker_prompt import (PLAN_SYSTEM_PROMPT, EXTRACT_SYSTEM_PROMPT, PLAN_NEXT_SYSTEM_PROMPT)
-from research_agent.graph.points import (seed_points, close_finished_points,evidence_count,required_evidence,
+from research_agent.validators.points import (seed_points, close_finished_points,evidence_count,required_evidence,
                                          should_stop,add_discovered, finalize_points, new_domain_evidence)
 
 
@@ -22,7 +22,10 @@ logger = logging.getLogger("research_agent/graph/worker_nodes.py")
 
 async def research_plan(state: ResearchWorkerState):
     """
+    子计划节点
+
     接收父graph传过来的`任务`
+
     产出：
     points 点
     pending_queries 待查询的1-2个问题
@@ -35,7 +38,6 @@ async def research_plan(state: ResearchWorkerState):
     if state.get("points"):
         print(f"----------research_plan {task.id} 已有点，跳过播种----------")
         return {}
-
 
     plan_model = llm.with_structured_output(
         ResearchWorkerPlan,
@@ -62,7 +64,7 @@ async def research_plan(state: ResearchWorkerState):
         parsed = ResearchWorkerPlan(points=[], queries=[])  # 交给 seed_points 兜底
 
     #检验与格式化LLM的输出
-    points, queries, warnings = seed_points(parsed, task)
+    points, queries, warnings = seed_points(parsed, task)   #分别为字典，列表，列表
     if warnings:
         logger.warning(
             "[seed_points] task=%s 产出 %d 条警告：points=%d queries=%d",
@@ -72,7 +74,7 @@ async def research_plan(state: ResearchWorkerState):
             logger.warning("[seed_points] task=%s %s", task.id, w)
     else:
         logger.info(
-            "[seed_points] task=%s 无警告：points=%d queries=%d",
+            "research_plan运行成功，这是任务：%s 无警告：产生点：%d个 种子问题%d个",
             task.id, len(points), len(queries),
         )
 
@@ -87,9 +89,21 @@ async def research_plan(state: ResearchWorkerState):
 
 
 
-MAX_SEARCH_CALLS = 6
-MAX_ERROR_CALLS = 2
+MAX_SEARCH_CALLS = 6    #最大搜索次数
+MAX_ERROR_CALLS = 2     #最大错误次数
 async def search_node(state: ResearchWorkerState):
+    """
+    搜索节点
+
+    拿到1-2个问题
+    检查是否已经搜索过
+    搜索累计不超过6次，超过直接结束
+    给新返回的结果的url建来源表且在这一步去重
+
+    返回累计来源
+    查询结果
+    拿到的成功执行搜索的问题
+    """
     task_id = state["task"].id
     search_calls = state.get("search_calls", 0)
     error_calls = state.get("error_calls", 0)
@@ -99,30 +113,30 @@ async def search_node(state: ResearchWorkerState):
     # ---------- 1. 决定这一轮跑哪些查询 ----------
     queries = list(state.get("pending_queries") or [])
 
-    # 已经成功搜过的查询不再重复花钱
-    tried_norm = {"".join(t.split()).lower() for t in tried}
-    queries = [q for q in queries if "".join(q.text.split()).lower() not in tried_norm]
 
     # 预算切分：本轮不许超出剩余搜索次数
     remaining = MAX_SEARCH_CALLS - search_calls
     runnable = queries[:max(remaining, 0)]
 
     def _empty(reason: str, add_error: int = 0):
-        print(f"----------search {task_id} 本轮不搜索：{reason}----------")
+        """
+        检查是否有新查询或预算是否用尽
+        没有新查询或者预算用尽直接结束
+        """
+        print(f"search_node运行结束，{reason}")
         return {
             "pending_queries": [],
             "new_results": [],
             "search_result": [{"query": "", "success": False, "search_result": []}],
             "error_calls": error_calls + add_error,
         }
-
     if not runnable:
         return _empty("没有可执行的新查询或预算用尽", add_error=1 if not queries else 0)
 
     # ---------- 2. 并发执行，单条失败不影响其他 ----------
     outcomes = await asyncio.gather(
         *(web_search_tool.ainvoke(q.text) for q in runnable),
-        return_exceptions=True,
+        return_exceptions=True,                 #一个炸了不影响另一个
     )
 
     # ---------- 3. 合并 + 去重 + 建来源表 ----------
@@ -142,12 +156,12 @@ async def search_node(state: ResearchWorkerState):
 
         for item in (outcome or {}).get("search_result") or []:
             url = item.get("url") or ""
-            key = norm_url(url)
+            key = norm_url(url)               #自定义函数，结构化url，用于后续去重
             if not key or key in seen:        # 历史见过，或本轮前一条查询刚见过
                 continue
             seen.add(key)
 
-            sid = item.get("id") or hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+            sid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
             if sid in sources:
                 continue
 
@@ -165,25 +179,26 @@ async def search_node(state: ResearchWorkerState):
     new_results = [sources[i] for i in new_ids]
 
     # ---------- 4. 日志 ----------
-    print(f"----------search {task_id} round={state.get('round', 0) + 1}----------")
+    logger.info(f"----------search {task_id} round={state.get('round', 0) + 1}----------")
     for q in runnable:
         print(f"  Q {q.text}  targets={q.targets}")
-    print(f"  本轮新增 {len(new_results)} 条 / 累计 {len(sources)} 条"
-          f"  搜索次数={search_calls}  错误={error_calls}")
+    logger.info(f"  本轮新增 {len(new_results)} 条 / 累计 {len(sources)} 条"
+                f"  搜索次数={search_calls}  错误={error_calls}")
     for e in errors:
-        print(f"  ! {e}")
+        logger.warning(f"  ! {e}")
     for s in new_results:
-        print(f"  + {s.id} [{s.domain}] {s.title[:50]}")
+        logger.info(f"  + {s.id} [{s.domain}] {s.title[:50]}")
 
 
     return {
-        "sources": sources,
+        "sources": sources,                          #累计来源
         "new_results": new_results,
         "pending_queries": [],                       # 已消费
         "queries_tried": tried + ok_queries,         # 只记成功执行过的
         "search_calls": search_calls,
         "error_calls": error_calls,
     }
+
 
 
 MAX_EXTRACT_RESULTS = 12        # 单轮最多让模型读这么多条结果，控制输入成本
@@ -202,6 +217,16 @@ def _render_results(results) -> str:
         for s in results
     )
 async def extract_node(state: ResearchWorkerState):
+    """
+    提取节点
+
+    获得搜索结果
+    判断是否还有开放的点和是否有新增加的搜索结果，两者都无就退出
+    调用LLM，获得findings列表
+    对findings列表进行校验，进行验证和去重等处理
+
+    输出累计的findings列表和当前新增的findings列表
+    """
     task = state["task"]
     points = state.get("points") or {}
     new_results = state.get("new_results") or []
@@ -219,7 +244,7 @@ async def extract_node(state: ResearchWorkerState):
               f"后 {len(new_results) - MAX_EXTRACT_RESULTS} 条不会被抽取（也不会有第二次机会）")
     by_id = {s.id: s for s in batch}
 
-    schema = make_extract_schema(open_ids, [s.id for s in batch])
+    schema = make_extract_schema(open_ids, [s.id for s in batch])   #拼装好的pydantic对象
 
     system = EXTRACT_SYSTEM_PROMPT.format(
         out_of_scope="、".join(state.get("out_of_scope") or []) or "（无）"
@@ -264,7 +289,7 @@ async def extract_node(state: ResearchWorkerState):
             f"open={open_ids}，results={[s.id for s in batch]}）"
         )
 
-    accepted, dropped = validate_extract(parsed.findings, by_id, set(open_ids))
+    accepted, dropped = validate_extract(parsed.findings, by_id, set(open_ids))   #校验器，返回经过验证的finding和出现的错误
 
     new_findings: list[Finding] = []
     for f in accepted:
@@ -295,24 +320,37 @@ async def extract_node(state: ResearchWorkerState):
 
 
 MAX_NO_PROGRESS = 2      # 连续几轮没有新证据就停
-MAX_ROUNDS = 6           # 轮数硬上限（你的规则本身上界是 N+2，这是防代码 bug 的兜底）
+MAX_ROUNDS = 6           # 轮数硬上限
 async def update_node(state: ResearchWorkerState):
+    """
+    更新节点
+
+    记录这是第几轮
+    拿到本轮新增的finding
+    判断`点`是否关闭完
+    打印信息，方便观测
+
+    返回连续几轮没有新证据
+    是否继续
+    停止原因
+    """
     # 复制一份再改：LangGraph 会共享嵌套对象，原地改动会污染 checkpointer 里的历史状态
     points = {pid: p.model_copy() for pid, p in (state.get("points") or {}).items()}
     findings = state.get("findings") or {}
     sources = state.get("sources") or {}
     round_findings = state.get("round_findings") or []
+    search_calls = state.get("search_calls", 0)
 
     round_no = state.get("round", 0) + 1
     no_progress = 0 if round_findings else state.get("no_progress", 0) + 1
     errors_exhausted = state.get("error_calls", 0) >= MAX_ERROR_CALLS
 
-    closed = close_finished_points(points, findings, sources)
-    stop, reason = should_stop(points, round_no, no_progress, errors_exhausted)
+    closed = close_finished_points(points, findings, sources)     #这个函数返回这轮关闭的点
+    stop, reason = should_stop(points, round_no, no_progress, search_calls, errors_exhausted)    #返回是否结束，关闭原因
 
     round_ids = {f.id for f in round_findings}
-    prev = {fid: f for fid, f in findings.items() if fid not in round_ids}
-    gained = new_domain_evidence(round_findings, prev, sources)
+    prev = {fid: f for fid, f in findings.items() if fid not in round_ids}   #不要重复的
+    gained = new_domain_evidence(round_findings, prev, sources)              #计算本轮新增的点
 
     no_progress = 0 if gained > 0 else state.get("no_progress", 0) + 1
 
@@ -342,16 +380,29 @@ async def update_node(state: ResearchWorkerState):
 MAX_QUERIES_PER_ROUND = 2
 MAX_TRIED_IN_PROMPT = 12
 async def plan_next(state: ResearchWorkerState):
+    """
+    提出下一个问题的节点
+
+    到了这个节点，LLM根据还未关闭的点提出1-2个问题，开始下一轮循环
+    如果LLM认为没必要再搜索就结束
+    这个节点还可以提出新的`点`
+    """
     task = state["task"]
     points = state.get("points") or {}
     findings = state.get("findings") or {}
     sources = state.get("sources") or {}
     round_no = state.get("round", 0)
 
+    #检查bug正常情况不触发
     open_ids = [pid for pid, p in points.items() if p.status == "open"]
+    assert open_ids, "plan_next 被调用但没有 open 点：should_stop / 路由逻辑不一致"
     if not open_ids:
-        print(f"----------plan_next {task.id} 跳过：没有开放的点----------")
-        return {"pending_queries": [], "no_queries": True}
+        return {
+            "pending_queries": [],
+            "no_queries": True,
+            "stop_now": True,
+            "stop_reason": "all_done",
+        }
 
     # ---------- 渲染材料 ----------
     lines = []
@@ -403,7 +454,7 @@ async def plan_next(state: ResearchWorkerState):
         raise WorkerFatalError(
             f"extract {task.id} 结构化输出失败，已终止（round={state.get('round')}，"
         )
-        return {"pending_queries": [], "no_queries": False}   # 不因一次解析失败就终止研究
+        #return {"pending_queries": [], "no_queries": False}   # 不因一次解析失败就终止研究
 
     # ---------- 查询：去重、限流 ----------
     tried_norm = {"".join(t.split()).lower() for t in (state.get("queries_tried") or [])}
@@ -452,14 +503,18 @@ async def plan_next(state: ResearchWorkerState):
 
 
 async def research_results(state: ResearchWorkerState):
-    """纯代码汇总。不再调用 LLM：findings 在 extract 已固化，这里只做收尾。"""
+    """
+    总结节点
+
+    纯代码，把finding，`点`，去掉原文的结果（证据）返回给父图
+    """
     task = state["task"]
     findings = state.get("findings") or {}
     sources = state.get("sources") or {}
 
-    points = finalize_points(state.get("points") or {}, findings, sources)
+    points = finalize_points(state.get("points") or {}, findings, sources)    #把目前还开放的点关闭附上各自的状态，然后收集起来
 
-    # 按点的顺序排，保证同一份 state 每次输出完全一致（报告可复现）
+    # 按点的顺序排，保证同一份 state 每次输出完全一致
     order = {pid: i for i, pid in enumerate(points)}
     ordered = sorted(
         findings.values(),
@@ -472,7 +527,7 @@ async def research_results(state: ResearchWorkerState):
         findings=ordered,
         points=list(points.values()),
         sources=[
-            s.model_copy(update={"summary": ""})  # 报告层不需要原文，quote 在 findings 里
+            s.model_copy(update={"summary": ""})  # 不需要原文
             for s in sources.values() if s.id in cited
         ],
     )

@@ -17,9 +17,9 @@ def norm_url(url: str) -> str:
     """去重口径。只做保守合并，不会把两个不同页面并成一个。"""
     if not url:
         return ""
-    p = urlparse(url.strip())
-    netloc = (p.netloc or "").lower()
-    if netloc.startswith("www."):
+    p = urlparse(url.strip())      #urlparse把 URL 拆成 6 段
+    netloc = (p.netloc or "").lower()    #netloc：域名+端口
+    if netloc.startswith("www."):       #去掉www.
         netloc = netloc[4:]
     query = [
         (k, v)

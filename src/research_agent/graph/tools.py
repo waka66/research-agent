@@ -1,9 +1,12 @@
 import os
+import logging
 
 from langchain.tools import tool
 from tavily import AsyncTavilyClient
 
 from research_agent.graph import cache
+
+logger = logging.getLogger("research_agent/graph/tools.py")
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 client = AsyncTavilyClient(TAVILY_API_KEY)
@@ -30,14 +33,12 @@ def _normalize(query: str, raw: dict) -> dict:
             for item in raw.get("results", [])
         ],
     }
-
-
 @tool
 async def web_search_tool(query: str) -> dict:
     """联网搜索互联网公开信息，返回标准化标题、摘要、来源URL"""
     cached = cache.get(query, CACHE_NS)
     if cached is not None:
-        print(f"  [cache] hit: {query[:50]}")
+        print("缓存命中")
         return cached
 
     if cache.OFFLINE:
