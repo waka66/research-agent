@@ -1,15 +1,14 @@
 import asyncio
-import json
 import logging
 import os
 import time
-from datetime import UTC, datetime
 
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 from tavily import AsyncTavilyClient
 
 from research_agent.graph import cache
+from research_agent.graph.observability import tool_log
 
 logger = logging.getLogger("research_agent/graph/tools.py")
 
@@ -43,73 +42,55 @@ def _normalize(query: str, raw: dict) -> dict:
 @tool
 async def web_search_tool(query: str, config: RunnableConfig) -> dict:
     """联网搜索互联网公开信息，返回标准化标题、摘要、来源URL"""
-    metadata = config.get("metadata") or {}
-    record = {
-        "run_id": (config.get("configurable") or {}).get("thread_id"),
-        "task_id": metadata.get("research_task_id"),
-        "round": metadata.get("research_round"),
-        "tool_name": "web_search_tool",
-        "query": query,
-        "started_at": datetime.now(UTC).isoformat(),
-        "duration_ms": None,
-        "status": "failed",
-        "cache_status": "unknown",
-        "cache_namespace": CACHE_NS,
-        "remote_requested": False,
-        "remote_duration_ms": None,
-        "result_count": None,
-        "error": None,
-    }
-    start = time.perf_counter()
-    stage = "cache_read"
-
-    try:
-        cached = cache.get(query, CACHE_NS)
-        record["cache_status"] = "hit" if cached is not None else "miss"
-        if cached is not None:
-            record["result_count"] = len(cached.get("search_result") or [])
-            record["status"] = "succeeded"
-            return cached
-
-        stage = "offline_check"
-        if cache.OFFLINE:
-            raise RuntimeError(f"离线模式且缓存未命中：{query}")
-
-        stage = "remote_search"
-        # 只表示进入了一次 SDK 调用，不代表供应商收到请求或产生计费。
-        record["remote_requested"] = True
-        remote_start = time.perf_counter()
+    with tool_log(logger, "web_search_tool", config) as record:
+        record.update(
+            {
+                "query": query,
+                "cache_status": "unknown",
+                "cache_namespace": CACHE_NS,
+                "remote_requested": False,
+                "remote_duration_ms": None,
+                "result_count": None,
+            }
+        )
+        stage = "cache_read"
         try:
-            raw = await client.search(
-                query=query,
-                search_depth=SEARCH_DEPTH,
-                max_results=MAX_RESULTS,
-            )
-        finally:
-            # 超时、异常和取消也保留已等待的时间。
-            record["remote_duration_ms"] = round(
-                (time.perf_counter() - remote_start) * 1000, 2
-            )
+            cached = cache.get(query, CACHE_NS)
+            record["cache_status"] = "hit" if cached is not None else "miss"
+            if cached is not None:
+                record["result_count"] = len(cached.get("search_result") or [])
+                record["status"] = "succeeded"
+                return cached
 
-        stage = "normalize"
-        payload = _normalize(query, raw)
-        record["result_count"] = len(payload["search_result"])
-        stage = "cache_write"
-        cache.put(query, payload, CACHE_NS)
-        record["status"] = "succeeded"
-        return payload
-    except asyncio.CancelledError:
-        record["status"] = "cancelled"
-        record["cancelled_stage"] = stage
-        raise
-    except Exception as exc:
-        record["error"] = {
-            "stage": stage,
-            "type": type(exc).__name__,
-            "message": str(exc),
-        }
-        raise
-    finally:
-        record["duration_ms"] = round((time.perf_counter() - start) * 1000, 2)
-        level = logging.ERROR if record["status"] == "failed" else logging.INFO
-        logger.log(level, json.dumps(record, ensure_ascii=False))
+            stage = "offline_check"
+            if cache.OFFLINE:
+                raise RuntimeError(f"离线模式且缓存未命中：{query}")
+
+            stage = "remote_search"
+            # 只表示进入了一次 SDK 调用，不代表供应商收到请求或产生计费。
+            record["remote_requested"] = True
+            remote_start = time.perf_counter()
+            try:
+                raw = await client.search(
+                    query=query,
+                    search_depth=SEARCH_DEPTH,
+                    max_results=MAX_RESULTS,
+                )
+            finally:
+                # 超时、异常和取消也保留已等待的时间。
+                record["remote_duration_ms"] = round((time.perf_counter() - remote_start) * 1000, 2)
+
+            stage = "normalize"
+            payload = _normalize(query, raw)
+            record["result_count"] = len(payload["search_result"])
+            stage = "cache_write"
+            cache.put(query, payload, CACHE_NS)
+            record["status"] = "succeeded"
+            return payload
+        except asyncio.CancelledError:
+            record["cancelled_stage"] = stage
+            raise
+        except Exception:
+            # 公共记录会补上异常类型和信息，这里只补充工具特有的阶段。
+            record["error"] = {"stage": stage}
+            raise
