@@ -164,7 +164,8 @@ class SearchNodeTests(unittest.IsolatedAsyncioTestCase):
         self.tool.return_value = {"search_result": []}
         result = await nodes.search_node(self.state, self.config)
         record = self.read_record("succeeded", logging.INFO)
-        self.tool.assert_awaited_once_with("查询甲")
+        self.tool.assert_awaited_once()
+        self.assertEqual(self.tool.await_args.args, ("查询甲",))
         self.assertEqual(record["output_summary"]["query_count"], 1)
         self.assertEqual(result["search_calls"], nodes.MAX_SEARCH_CALLS)
 
@@ -181,7 +182,7 @@ class SearchNodeTests(unittest.IsolatedAsyncioTestCase):
         started = []
         cancelled = []
 
-        async def wait_for_cancel(query):
+        async def wait_for_cancel(query, *, config):
             started.append(query)
             if len(started) == 2:
                 both_started.set()
@@ -218,6 +219,37 @@ class SearchNodeTests(unittest.IsolatedAsyncioTestCase):
         result = await builder.compile().ainvoke(self.state, config=self.config)
         self.read_record("succeeded", logging.INFO)
         self.assertEqual(result["search_calls"], 3)
+
+    async def test_tool_receives_context_without_mutating_parent_config(self):
+        self.config["metadata"] = {"caller": "test"}
+        self.config["tags"] = ["keep-tag"]
+        before = deepcopy(self.config)
+        self.tool.return_value = {"search_result": []}
+        await nodes.search_node(self.state, self.config)
+        for call in self.tool.await_args_list:
+            config = call.kwargs["config"]
+            self.assertEqual(config["configurable"]["thread_id"], "run-test")
+            self.assertEqual(config["metadata"], {
+                "caller": "test", "research_task_id": "T2", "research_round": 3,
+            })
+            self.assertEqual(config["tags"], ["keep-tag"])
+        self.assertEqual(self.config, before)
+
+    async def test_parallel_research_tasks_keep_separate_tool_context(self):
+        other = deepcopy(self.state)
+        other["task"].id = "T3"
+        other["pending_queries"] = [Query(text="另一个任务")]
+        self.tool.return_value = {"search_result": []}
+        await asyncio.gather(
+            nodes.search_node(self.state, self.config),
+            nodes.search_node(other, self.config),
+        )
+        contexts = {
+            call.args[0]: call.kwargs["config"]["metadata"]["research_task_id"]
+            for call in self.tool.await_args_list
+        }
+        self.assertEqual(contexts, {"查询甲": "T2", "查询乙": "T2", "另一个任务": "T3"})
+        self.assertNotIn("metadata", self.config)
 
 
 if __name__ == "__main__":

@@ -96,11 +96,6 @@ async def research_plan(state: ResearchWorkerState, config: RunnableConfig):
             )
             for w in warnings:
                 logger.warning("[seed_points] task=%s %s", task.id, w)
-        else:
-            logger.info(
-                "research_plan运行成功，这是任务：%s 无警告：产生点：%d个 种子问题%d个",
-                task.id, len(points), len(queries),
-            )
 
         record["status"] = "succeeded"
         record["output_summary"] = {
@@ -195,9 +190,18 @@ async def search_node(state: ResearchWorkerState, config: RunnableConfig):
                 "error_calls": error_calls + (1 if not queries else 0),
             }
 
+        # 给工具日志传递业务上下文；复制 metadata，避免并行研究任务互相覆盖。
+        tool_config = {
+            **config,
+            "metadata": {
+                **(config.get("metadata") or {}),
+                "research_task_id": record["task_id"],
+                "research_round": record["round"],
+            },
+        }
         # 单条工具异常允许其他查询完成，取消则仍然向外传播。
         outcomes = await asyncio.gather(
-            *(web_search_tool.ainvoke(q.text) for q in runnable),
+            *(web_search_tool.ainvoke(q.text, config=tool_config) for q in runnable),
             return_exceptions=True,
         )
 
