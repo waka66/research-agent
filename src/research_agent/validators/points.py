@@ -91,15 +91,9 @@ def seed_points(
 
     # 空清单 = should_stop 立刻为 True = 空报告，必须兜底
     if not points:
-        pid = f"{task.id}-p0"
-        points[pid] = PointState(
-            id=pid,
-            text=" ".join((task.objective or task.question).split()),
-            kind="multi_source_fact",
-            priority="key",
-            round_added=0,
+        raise ValueError(
+            f"research_plan 清洗后没有有效研究点，task_id={task.id}"
         )
-        warnings.append("plan 没有产出有效点，已用 task.objective 兜底 1 个点")
 
     all_ids = list(points)   #取points的所有 key，得到"所有 point 的 id 列表"
 
@@ -134,7 +128,14 @@ def seed_points(
         seen_query.add(normalize(text))
 
     if not queries:
-        queries = [Query(text=" ".join(task.question.split()), targets=all_ids)]
+        fallback_query = " ".join(task.question.split())
+
+        if not fallback_query:
+            raise ValueError(
+                f"没有有效查询，且原始任务问题为空，task_id={task.id}"
+            )
+
+        queries = [Query(text=fallback_query, targets=all_ids)]
         warnings.append("plan 没有产出有效查询，已用 task.question 兜底")
 
     return points, queries, warnings

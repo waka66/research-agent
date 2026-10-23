@@ -3,7 +3,11 @@ from langgraph.types import Send
 import asyncio
 import hashlib
 import logging
+import json
 import time
+from datetime import UTC, datetime
+
+from langchain_core.runnables import RunnableConfig
 
 from research_agent.graph.error import WorkerFatalError
 from research_agent.llm import llm
@@ -20,7 +24,7 @@ from research_agent.validators.points import (seed_points, close_finished_points
 logger = logging.getLogger("research_agent/graph/worker_nodes.py")
 
 
-async def research_plan(state: ResearchWorkerState):
+async def research_plan(state: ResearchWorkerState, config: RunnableConfig):
     """
     子计划节点
 
@@ -32,60 +36,113 @@ async def research_plan(state: ResearchWorkerState):
     out_of_scope 超出范围的东西，预付搜索过多
     round 已完成的搜索轮数
     """
-    task = state["task"]
 
-    # 幂等：重试 / 恢复时不重新播种，避免点被换掉
-    if state.get("points"):
-        print(f"----------research_plan {task.id} 已有点，跳过播种----------")
-        return {}
-
-    plan_model = llm.with_structured_output(
-        ResearchWorkerPlan,
-        method="function_calling",
-        include_raw=True,
-    )
-    response = await plan_model.ainvoke(
-        [
-            SystemMessage(content=PLAN_SYSTEM_PROMPT),
-            HumanMessage(
-                content=(
-                    f"任务 id：{task.id}\n"
-                    f"研究问题：{task.question}\n"
-                    f"研究目标：{task.objective}"
-                )
-            ),
-        ]
-    )
-
-    parsed = response.get("parsed") if isinstance(response, dict) else response
-    if parsed is None:
-        print(f"----------research_plan {task.id} 解析失败----------")
-        print(response)
-        parsed = ResearchWorkerPlan(points=[], queries=[])  # 交给 seed_points 兜底
-
-    #检验与格式化LLM的输出
-    points, queries, warnings = seed_points(parsed, task)   #分别为字典，列表，列表
-    if warnings:
-        logger.warning(
-            "[seed_points] task=%s 产出 %d 条警告：points=%d queries=%d",
-            task.id, len(warnings), len(points), len(queries),
-        )
-        for w in warnings:
-            logger.warning("[seed_points] task=%s %s", task.id, w)
-    else:
-        logger.info(
-            "research_plan运行成功，这是任务：%s 无警告：产生点：%d个 种子问题%d个",
-            task.id, len(points), len(queries),
-        )
-
-
-    return {
-        "points": points,
-        "pending_queries": queries,
-        "queries_tried": [],
-        "out_of_scope": parsed.out_of_scope or [],
-        "round": 0,
+    record = {
+        "run_id": config["configurable"]["thread_id"],
+        "node_name": "research_plan",
+        "started_at": datetime.now(UTC).isoformat(),
+        "duration_ms": None,
+        "status": "failed",
+        "error": None,
     }
+    start = time.perf_counter()
+
+    task = state["task"]
+    record["task_id"] = task.id
+
+    try:
+        # 幂等：重试 / 恢复时不重新播种，避免点被换掉
+        if state.get("points"):
+            record["status"] = "skipped"
+            record["output_summary"] = {
+                "reason": "existing_points"
+            }
+            return {}
+
+        plan_model = llm.with_structured_output(
+            ResearchWorkerPlan,
+            method="function_calling",
+            include_raw=True,
+        )
+        response = await plan_model.ainvoke(
+            [
+                SystemMessage(content=PLAN_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=(
+                        f"任务 id：{task.id}\n"
+                        f"研究问题：{task.question}\n"
+                        f"研究目标：{task.objective}"
+                    )
+                ),
+            ]
+        )
+
+        record["usage"] = response["raw"].usage_metadata
+
+        parsed = response.get("parsed")
+
+        if parsed is None:
+            parsing_error = response.get("parsing_error")
+            raise WorkerFatalError(
+                f"research_plan 解析失败，task_id={task.id}：{parsing_error}"
+            ) from parsing_error
+
+        #检验与格式化LLM的输出
+        points, queries, warnings = seed_points(parsed, task)   #分别为字典，列表，列表
+        if warnings:
+            logger.warning(
+                "[seed_points] task=%s 产出 %d 条警告：points=%d queries=%d",
+                task.id, len(warnings), len(points), len(queries),
+            )
+            for w in warnings:
+                logger.warning("[seed_points] task=%s %s", task.id, w)
+        else:
+            logger.info(
+                "research_plan运行成功，这是任务：%s 无警告：产生点：%d个 种子问题%d个",
+                task.id, len(points), len(queries),
+            )
+
+        record["status"] = "succeeded"
+        record["output_summary"] = {
+            "point_count": len(points),
+            "query_count": len(queries),
+            "warning_count": len(warnings),
+        }
+
+        return {
+            "points": points,
+            "pending_queries": queries,
+            "queries_tried": [],
+            "out_of_scope": parsed.out_of_scope or [],
+            "round": 0,
+        }
+    except asyncio.CancelledError:
+        # 取消单独记录，并继续向外传播
+        record["status"] = "cancelled"
+        raise
+
+    except Exception as exc:
+        # ④ 记录失败原因，但不吞掉异常
+        record["status"] = "failed"
+        record["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        raise
+
+    finally:
+        # ⑤ 正常返回、异常退出、取消都会经过这里
+        record["duration_ms"] = round(
+            (time.perf_counter() - start) * 1000,
+            2,
+        )
+
+        level = (
+            logging.ERROR
+            if record["status"] == "failed"
+            else logging.INFO
+        )
+        logger.log(level, json.dumps(record, ensure_ascii=False))
 
 
 
