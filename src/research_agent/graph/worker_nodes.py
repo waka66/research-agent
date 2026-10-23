@@ -148,113 +148,138 @@ async def research_plan(state: ResearchWorkerState, config: RunnableConfig):
 
 MAX_SEARCH_CALLS = 6    #最大搜索次数
 MAX_ERROR_CALLS = 2     #最大错误次数
-async def search_node(state: ResearchWorkerState):
-    """
-    搜索节点
-
-    拿到1-2个问题
-    检查是否已经搜索过
-    搜索累计不超过6次，超过直接结束
-    给新返回的结果的url建来源表且在这一步去重
-
-    返回累计来源
-    查询结果
-    拿到的成功执行搜索的问题
-    """
-    task_id = state["task"].id
-    search_calls = state.get("search_calls", 0)
-    error_calls = state.get("error_calls", 0)
-    sources = dict(state.get("sources") or {})       #累计来源表
-    tried = list(state.get("queries_tried") or [])   #执行过的查询任务
-
-    # ---------- 1. 决定这一轮跑哪些查询 ----------
-    queries = list(state.get("pending_queries") or [])
-
-
-    # 预算切分：本轮不许超出剩余搜索次数
-    remaining = MAX_SEARCH_CALLS - search_calls
-    runnable = queries[:max(remaining, 0)]
-
-    def _empty(reason: str, add_error: int = 0):
-        """
-        检查是否有新查询或预算是否用尽
-        没有新查询或者预算用尽直接结束
-        """
-        print(f"search_node运行结束，{reason}")
-        return {
-            "pending_queries": [],
-            "new_results": [],
-            "search_result": [{"query": "", "success": False, "search_result": []}],
-            "error_calls": error_calls + add_error,
-        }
-    if not runnable:
-        return _empty("没有可执行的新查询或预算用尽", add_error=1 if not queries else 0)
-
-    # ---------- 2. 并发执行，单条失败不影响其他 ----------
-    outcomes = await asyncio.gather(
-        *(web_search_tool.ainvoke(q.text) for q in runnable),
-        return_exceptions=True,                 #一个炸了不影响另一个
-    )
-
-    # ---------- 3. 合并 + 去重 + 建来源表 ----------
-    seen = {s.norm_url for s in sources.values() if s.norm_url}
-    new_ids: list[str] = []
-    errors: list[str] = []
-    ok_queries: list[str] = []
-
-    for q, outcome in zip(runnable, outcomes):
-        if isinstance(outcome, BaseException):
-            errors.append(f"[{q.text}] {type(outcome).__name__}: {outcome}")
-            error_calls += 1
-            continue
-
-        search_calls += 1
-        ok_queries.append(q.text)
-
-        for item in (outcome or {}).get("search_result") or []:
-            url = item.get("url") or ""
-            key = norm_url(url)               #自定义函数，结构化url，用于后续去重
-            if not key or key in seen:        # 历史见过，或本轮前一条查询刚见过
-                continue
-            seen.add(key)
-
-            sid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-            if sid in sources:
-                continue
-
-            src = Source(
-                id=sid,
-                url=url,
-                norm_url=key,
-                domain=registrable_domain(url),
-                title=item.get("title") or "",
-                summary=item.get("summary") or "",
-            )
-            sources[sid] = src
-            new_ids.append(sid)
-
-    new_results = [sources[i] for i in new_ids]
-
-    # ---------- 4. 日志 ----------
-    logger.info(f"----------search {task_id} round={state.get('round', 0) + 1}----------")
-    for q in runnable:
-        print(f"  Q {q.text}  targets={q.targets}")
-    logger.info(f"  本轮新增 {len(new_results)} 条 / 累计 {len(sources)} 条"
-                f"  搜索次数={search_calls}  错误={error_calls}")
-    for e in errors:
-        logger.warning(f"  ! {e}")
-    for s in new_results:
-        logger.info(f"  + {s.id} [{s.domain}] {s.title[:50]}")
-
-
-    return {
-        "sources": sources,                          #累计来源
-        "new_results": new_results,
-        "pending_queries": [],                       # 已消费
-        "queries_tried": tried + ok_queries,         # 只记成功执行过的
-        "search_calls": search_calls,
-        "error_calls": error_calls,
+async def search_node(state: ResearchWorkerState, config: RunnableConfig):
+    """并发搜索、合并来源，并记录本轮查询的执行状态与产出。"""
+    record = {
+        "run_id": config["configurable"]["thread_id"],
+        "node_name": "search_node",
+        "task_id": state["task"].id,
+        "round": state.get("round", 0) + 1,
+        "started_at": datetime.now(UTC).isoformat(),
+        "duration_ms": None,
+        "status": "failed",
+        "error": None,
+        "query_errors": [],
     }
+    start = time.perf_counter()
+
+    try:
+        search_calls = state.get("search_calls", 0)
+        error_calls = state.get("error_calls", 0)
+        sources = dict(state.get("sources") or {})
+        tried = list(state.get("queries_tried") or [])
+        queries = list(state.get("pending_queries") or [])
+
+        # 保留现有预算口径：search_calls 累计成功的工具调用，失败另计。
+        # 工具可能命中缓存，因此这些次数不能直接当作远程请求数或费用。
+        remaining = MAX_SEARCH_CALLS - search_calls
+        runnable = queries[:max(remaining, 0)]
+        summary = {
+            "query_count": len(runnable),
+            "succeeded_query_count": 0,
+            "failed_query_count": 0,
+            "new_source_count": 0,
+            "total_source_count": len(sources),
+        }
+        record["output_summary"] = summary
+
+        if not runnable:
+            record["status"] = "skipped"
+            summary["reason"] = (
+                "search_budget_exhausted" if remaining <= 0 else "no_pending_queries"
+            )
+            return {
+                "pending_queries": [],
+                "new_results": [],
+                "search_result": [{"query": "", "success": False, "search_result": []}],
+                "error_calls": error_calls + (1 if not queries else 0),
+            }
+
+        # 单条工具异常允许其他查询完成，取消则仍然向外传播。
+        outcomes = await asyncio.gather(
+            *(web_search_tool.ainvoke(q.text) for q in runnable),
+            return_exceptions=True,
+        )
+
+        seen = {s.norm_url for s in sources.values() if s.norm_url}
+        new_ids: list[str] = []
+        ok_queries: list[str] = []
+
+        for q, outcome in zip(runnable, outcomes):
+            if isinstance(outcome, BaseException):
+                if not isinstance(outcome, Exception):
+                    raise outcome
+                record["query_errors"].append({
+                    "query": q.text,
+                    "type": type(outcome).__name__,
+                    "message": str(outcome),
+                })
+                summary["failed_query_count"] += 1
+                error_calls += 1
+                continue
+
+            search_calls += 1
+            ok_queries.append(q.text)
+            summary["succeeded_query_count"] += 1
+
+            for item in (outcome or {}).get("search_result") or []:
+                url = item.get("url") or ""
+                key = norm_url(url)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+
+                sid = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+                if sid in sources:
+                    continue
+
+                sources[sid] = Source(
+                    id=sid,
+                    url=url,
+                    norm_url=key,
+                    domain=registrable_domain(url),
+                    title=item.get("title") or "",
+                    summary=item.get("summary") or "",
+                )
+                new_ids.append(sid)
+                summary["new_source_count"] = len(new_ids)
+                summary["total_source_count"] = len(sources)
+
+        if not ok_queries:
+            # 全部搜索失败仍返回错误计数，由后续 update_node 裁决是否停止。
+            record["status"] = "failed"
+            record["error"] = {
+                "type": "AllSearchQueriesFailed",
+                "message": "本轮所有搜索查询失败，详情见 query_errors",
+            }
+        elif record["query_errors"]:
+            record["status"] = "partial_success"
+        else:
+            # 查询成功但没有结果也是 succeeded，成果由 new_source_count 表达。
+            record["status"] = "succeeded"
+
+        return {
+            "sources": sources,
+            "new_results": [sources[i] for i in new_ids],
+            "pending_queries": [],
+            "queries_tried": tried + ok_queries,
+            "search_calls": search_calls,
+            "error_calls": error_calls,
+        }
+    except asyncio.CancelledError:
+        record["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        record["status"] = "failed"
+        record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        raise
+    finally:
+        record["duration_ms"] = round((time.perf_counter() - start) * 1000, 2)
+        level = {
+            "failed": logging.ERROR,
+            "partial_success": logging.WARNING,
+        }.get(record["status"], logging.INFO)
+        logger.log(level, json.dumps(record, ensure_ascii=False))
 
 
 
