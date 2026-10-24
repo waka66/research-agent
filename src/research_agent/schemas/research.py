@@ -32,6 +32,7 @@ class ResearchStatusResponse(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     checkpoint_available: bool = True
+    records_complete: bool
     plan: "ResearchPlan | None" = None
     results: "list[ResearchResult]" = Field(default_factory=list)
     final_answer: str | None = None

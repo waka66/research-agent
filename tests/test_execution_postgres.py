@@ -10,8 +10,9 @@ import os
 import re
 import sys
 import unittest
+from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID, uuid4
 
 import httpx
@@ -25,6 +26,7 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from test_execution_lifecycle import FakeAgent, load_file
 
 from research_agent.db.errors import ExecutionConflictError
+from research_agent.graph import observability as obs
 
 
 @unittest.skipUnless(os.getenv("RUN_POSTGRES_TESTS") == "1", "需要显式开启 PostgreSQL 联调")
@@ -36,11 +38,13 @@ class PostgresExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.history = importlib.import_module("research_agent.db.history")
+        self.record_store = importlib.import_module("research_agent.db.records")
         models = importlib.import_module("research_agent.db.models")
         session_module = importlib.import_module("research_agent.db.session")
         from research_agent.config import settings
 
         self.Run, self.Execution = models.ResearchRun, models.RunExecution
+        self.Record = models.ExecutionRecord
         self.schema = f"test_execution_{uuid4().hex}"
         self.admin_engine = create_async_engine(session_module.database_url, poolclass=NullPool)
         self.engine = create_async_engine(
@@ -59,6 +63,9 @@ class PostgresExecutionTests(unittest.IsolatedAsyncioTestCase):
             await connection.run_sync(models.Base.metadata.create_all)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         replacement = patch.object(self.history, "SessionFactory", self.sessions)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+        replacement = patch.object(self.record_store, "SessionFactory", self.sessions)
         replacement.start()
         self.addCleanup(replacement.stop)
         self.run_ids = set()
@@ -128,6 +135,33 @@ class PostgresExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 202, result.text)
         payload = result.json()
         return UUID(payload["run_id"]), UUID(payload["execution_id"])
+
+    async def saved_records(self, execution_id):
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(self.Record)
+                    .where(self.Record.execution_id == execution_id)
+                    .order_by(self.Record.started_at, self.Record.record_id),
+                )
+            ).all()
+            return [
+                {column.name: getattr(row, column.name) for column in self.Record.__table__.columns}
+                for row in rows
+            ]
+
+    async def create_record_execution(self):
+        run_id, execution_id = uuid4(), uuid4()
+        self.run_ids.add(run_id)
+        await self.history.create_start_execution(
+            run_id, execution_id, "[integration-test] 过程记录"
+        )
+        await self.history.mark_execution_running(execution_id)
+        config = {
+            "configurable": {"thread_id": str(run_id)},
+            "metadata": {"execution_id": str(execution_id)},
+        }
+        return run_id, execution_id, config
 
     async def test_completed_is_committed_and_readable_through_http(self):
         run_id, execution_id = await self.start()
@@ -364,6 +398,10 @@ class PostgresExecutionTests(unittest.IsolatedAsyncioTestCase):
                     old = await self.history.get_execution(old_id)
                     self.assertEqual(old["status"], "failed")
                     self.assertEqual(old["error"]["type"], "WorkerFatalError")
+                    self.assertTrue(old["records_complete"])
+                    old_records = await self.saved_records(old_id)
+                    self.assertTrue(old_records)
+                    self.assertTrue(any(r["status"] == "failed" for r in old_records))
                     snapshot = await self.service.research_status(self.agent, run_id)
                     self.assertEqual(snapshot.next, ("research_node",))
                 self.api.runs.clear()
@@ -379,6 +417,23 @@ class PostgresExecutionTests(unittest.IsolatedAsyncioTestCase):
                     new = await self.history.get_execution(new_id)
                     self.assertEqual((new["mode"], new["status"]), ("resume", "completed"))
                     self.assertEqual(await self.history.get_execution(old_id), old)
+                    self.assertEqual(await self.saved_records(old_id), old_records)
+                    new_records = await self.saved_records(new_id)
+                    self.assertTrue(new["records_complete"])
+                    self.assertEqual(
+                        len(new_records),
+                        len(
+                            resumed := [
+                                r for _, r in fixture.records if r["execution_id"] == str(new_id)
+                            ]
+                        ),
+                    )
+                    self.assertNotIn("search_node", [r["name"] for r in new_records])
+                    parents = {r["record_id"]: r for r in new_records}
+                    child = next(r for r in new_records if r["name"] == "extract_node")
+                    self.assertEqual(parents[child["parent_record_id"]]["name"], "research_node")
+                    self.assertEqual(child["payload"]["usage"]["total_tokens"], 20)
+                    self.assertEqual(len(child["payload"]["attempts"]), 1)
                     snapshot = await self.service.research_status(self.agent, run_id)
                     self.assertEqual(snapshot.next, ())
                     self.assertIn("证据清单", snapshot.values["final_answer"])
@@ -387,17 +442,217 @@ class PostgresExecutionTests(unittest.IsolatedAsyncioTestCase):
                     worker_plan.assert_awaited_once()
                     search.assert_awaited_once()
                     self.assertEqual(extract.await_count, 2)
-                    resumed_logs = [
-                        record
-                        for _, record in fixture.records
-                        if record["execution_id"] == str(new_id)
-                    ]
-                    self.assertTrue(resumed_logs)
-                    self.assertNotIn("search_node", [r["node_name"] for r in resumed_logs])
+                    self.assertTrue(resumed)
+                    self.assertNotIn("search_node", [r["node_name"] for r in resumed])
         finally:
             if run_id is not None:
                 async with AsyncPostgresSaver.from_conn_string(self.checkpoint_uri) as saver:
                     await saver.adelete_thread(str(run_id))
+
+    async def test_running_node_and_real_tool_cache_records_are_committed(self):
+        from pathlib import Path
+
+        from test_search_tool import tools
+
+        _, execution_id, config = await self.create_record_execution()
+        config["metadata"].update(research_task_id="T1", research_round=1)
+        remote = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "url": "https://example.com/doc",
+                        "content": "测试资料",
+                    }
+                ]
+            }
+        )
+        with (
+            TemporaryDirectory() as directory,
+            patch.object(tools.cache, "CACHE_DIR", Path(directory)),
+            patch.object(tools.cache, "OFFLINE", False),
+            patch.object(tools.client, "search", remote),
+            patch.object(tools.logger, "log"),
+            obs.recording_execution(execution_id, self.record_store) as context,
+        ):
+            async with obs.node_log(
+                Mock(),
+                "search_node",
+                {"task": SimpleNamespace(id="T1")},
+                config,
+                round_number=1,
+            ) as node:
+                (running,) = await self.saved_records(execution_id)
+                self.assertEqual(running["status"], "running")
+                self.assertIsNone(running["finished_at"])
+                await tools.web_search_tool.ainvoke("集成测试查询", config=config)
+                await tools.web_search_tool.ainvoke("集成测试查询", config=config)
+                node["output_summary"] = {"succeeded_query_count": 2}
+            self.assertTrue(context.records_complete)
+        rows = await self.saved_records(execution_id)
+        self.assertEqual(len(rows), 3)
+        root, first_tool, second_tool = rows
+        self.assertEqual(root["payload"]["output_summary"], {"succeeded_query_count": 2})
+        for item in (first_tool, second_tool):
+            self.assertEqual(item["kind"], "tool")
+            self.assertEqual(item["parent_record_id"], root["record_id"])
+            self.assertEqual((item["task_id"], item["round"]), ("T1", 1))
+            self.assertEqual(item["status"], "succeeded")
+        self.assertEqual(first_tool["payload"]["cache_status"], "miss")
+        self.assertTrue(first_tool["payload"]["remote_requested"])
+        self.assertEqual(second_tool["payload"]["cache_status"], "hit")
+        self.assertFalse(second_tool["payload"]["remote_requested"])
+        remote.assert_awaited_once()
+        await self.history.finish_execution(execution_id, "completed")
+
+    async def test_record_write_failure_keeps_business_success_but_marks_incomplete(self):
+        base_agent = self.agent
+
+        class TracedAgent(FakeAgent):
+            async def astream(inner, inputs, config, stream_mode):
+                async with obs.node_log(Mock(), "Planner", {}, config) as record:
+                    record["output_summary"] = {"task_count": 1}
+                async for item in base_agent.astream(inputs, config, stream_mode):
+                    yield item
+
+        self.agent = TracedAgent()
+        with (
+            patch.object(
+                self.record_store, "finish_record", side_effect=ConnectionError("模拟写入失败")
+            ),
+            patch.object(obs.persistence_logger, "exception"),
+        ):
+            run_id, execution_id = await self.start()
+            await asyncio.wait_for(self.api.runs[run_id], timeout=10)
+        row = await self.history.get_execution(execution_id)
+        self.assertEqual(row["status"], "completed")
+        self.assertFalse(row["records_complete"])
+        (record,) = await self.saved_records(execution_id)
+        self.assertEqual(record["status"], "unknown")
+        self.assertIsNone(record["duration_ms"])
+        self.assertIsNone(record["finished_at"])
+        self.assertEqual(record["payload"]["error"]["type"], "RecordIncomplete")
+        status = await self.client.get(f"/research/{run_id}")
+        self.assertFalse(status.json()["records_complete"])
+        self.assertIn(
+            "event: completed", (await self.client.get(f"/research/{run_id}/stream")).text
+        )
+        # 重复结束不能把“不完整”恢复成 True。
+        await self.history.finish_execution(execution_id, "completed")
+        self.assertFalse((await self.history.get_execution(execution_id))["records_complete"])
+
+    async def test_cancelled_execution_has_cancelled_node_and_tool_records(self):
+        entered = asyncio.Event()
+
+        class WaitingAgent(FakeAgent):
+            async def astream(inner, inputs, config, stream_mode):
+                async with obs.node_log(Mock(), "search_node", {}, config):
+                    async with obs.tool_log(Mock(), "web_search_tool", config):
+                        entered.set()
+                        await asyncio.Event().wait()
+                yield {}  # 保持异步生成器接口；取消后不会执行。
+
+        self.agent = WaitingAgent()
+        run_id, execution_id = await self.start()
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        result = await self.client.post(f"/research/{run_id}/cancel")
+        self.assertEqual(result.json()["status"], "cancelled")
+        records = await self.saved_records(execution_id)
+        self.assertEqual([r["status"] for r in records], ["cancelled", "cancelled"])
+        self.assertTrue(all(r["finished_at"] is not None for r in records))
+        self.assertTrue((await self.history.get_execution(execution_id))["records_complete"])
+
+    async def test_orphan_records_are_interrupted_without_invented_finish_time(self):
+        from datetime import UTC, datetime
+
+        _, execution_id, config = await self.create_record_execution()
+        payload = {
+            "record_id": str(uuid4()),
+            "execution_id": str(execution_id),
+            "parent_record_id": None,
+            "kind": "node",
+            "name": "Planner",
+            "node_name": "Planner",
+            "run_id": config["configurable"]["thread_id"],
+            "status": "running",
+            "started_at": datetime.now(UTC).isoformat(),
+            "finished_at": None,
+            "duration_ms": None,
+            "error": None,
+        }
+        await self.record_store.start_record(payload)
+        await self.history.interrupt_active_executions(self.run_ids)
+        (row,) = await self.saved_records(execution_id)
+        self.assertEqual(row["status"], "interrupted")
+        self.assertEqual(row["payload"]["status"], "interrupted")
+        self.assertEqual(row["payload"]["error"]["type"], "ProcessInterrupted")
+        self.assertIn("observed_at", row["payload"])
+        self.assertIsNone(row["finished_at"])
+        self.assertIsNone(row["duration_ms"])
+        self.assertFalse((await self.history.get_execution(execution_id))["records_complete"])
+        await self.history.interrupt_active_executions(self.run_ids)
+        self.assertEqual((await self.saved_records(execution_id))[0], row)
+
+    async def test_parent_foreign_key_cannot_reference_another_execution(self):
+        _, first_id, first_config = await self.create_record_execution()
+        _, second_id, second_config = await self.create_record_execution()
+        with obs.recording_execution(first_id, self.record_store):
+            async with obs.node_log(Mock(), "Planner", {}, first_config) as first:
+                pass
+        # 取得完整合法 payload，只更改关联，让数据库检验跨 execution 的父节点。
+        with obs.recording_execution(second_id, self.record_store):
+            async with obs.node_log(Mock(), "Planner", {}, second_config) as second:
+                pass
+        bad = {
+            **second,
+            "record_id": str(uuid4()),
+            "parent_record_id": first["record_id"],
+            "status": "running",
+            "finished_at": None,
+            "duration_ms": None,
+        }
+        with self.assertRaises(IntegrityError):
+            await self.record_store.start_record(bad)
+
+    async def test_parallel_database_writes_preserve_branch_parents(self):
+        _, execution_id, config = await self.create_record_execution()
+        barrier = asyncio.Barrier(3)
+
+        async def branch(task_id):
+            async with obs.node_log(
+                Mock(),
+                "search_node",
+                {"task": SimpleNamespace(id=task_id)},
+                config,
+            ) as node:
+                await barrier.wait()
+                tool_config = {
+                    **config,
+                    "metadata": {
+                        **config["metadata"],
+                        "research_task_id": task_id,
+                    },
+                }
+                async with obs.tool_log(Mock(), "web_search_tool", tool_config) as tool:
+                    self.assertEqual(tool["parent_record_id"], node["record_id"])
+
+        with obs.recording_execution(execution_id, self.record_store) as context:
+            async with obs.node_log(Mock(), "research_node", {}, config) as root:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(branch(task_id) for task_id in ("T1", "T2", "T3")),
+                    ),
+                    timeout=10,
+                )
+            self.assertTrue(context.records_complete)
+        rows = await self.saved_records(execution_id)
+        self.assertEqual(len(rows), 7)
+        nodes = {r["task_id"]: r for r in rows if r["name"] == "search_node"}
+        for item in rows:
+            if item["name"] == "search_node":
+                self.assertEqual(item["parent_record_id"], UUID(root["record_id"]))
+            if item["kind"] == "tool":
+                self.assertEqual(item["parent_record_id"], nodes[item["task_id"]]["record_id"])
+        await self.history.finish_execution(execution_id, "completed")
 
 
 if __name__ == "__main__":

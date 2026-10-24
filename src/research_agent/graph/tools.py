@@ -42,7 +42,7 @@ def _normalize(query: str, raw: dict) -> dict:
 @tool
 async def web_search_tool(query: str, config: RunnableConfig) -> dict:
     """联网搜索互联网公开信息，返回标准化标题、摘要、来源URL"""
-    with tool_log(logger, "web_search_tool", config) as record:
+    async with tool_log(logger, "web_search_tool", config) as record:
         record.update(
             {
                 "query": query,

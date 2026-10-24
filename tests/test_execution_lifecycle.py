@@ -47,6 +47,7 @@ class MemoryHistory:
             "started_at": None,
             "finished_at": None,
             "error": None,
+            "records_complete": True,
         }
 
     async def mark_execution_running(self, execution_id):
@@ -69,10 +70,11 @@ class MemoryHistory:
         await self.create_start_execution(run_id, execution_id, latest["question"])
         self.rows[execution_id]["mode"] = "resume"
 
-    async def finish_execution(self, execution_id, status, error=None):
+    async def finish_execution(self, execution_id, status, error=None, *, records_complete=True):
         if self.finish_error:
             raise self.finish_error
         row = self.rows[execution_id]
+        row["records_complete"] = row["records_complete"] and records_complete
         if row["status"] == status:
             return False
         assert row["status"] in {"pending", "running"}
@@ -126,6 +128,9 @@ class FakeAgent:
 
 class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        # patch.dict(sys.modules) 会移除范围内新导入的模块；提前加载，避免数据库测试
+        # 随后加载另一套 SQLAlchemy PostgreSQL 类型，破坏 JSONB 参数推断。
+        self.record_store = importlib.import_module("research_agent.db.records")
         self.history = MemoryHistory()
         self.agent = FakeAgent()
         history_module = ModuleType("research_agent.db.history")
@@ -353,10 +358,10 @@ class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         entered, release = asyncio.Event(), asyncio.Event()
         original = self.history.finish_execution
 
-        async def blocked_finish(*args):
+        async def blocked_finish(*args, **kwargs):
             entered.set()
             await release.wait()
-            return await original(*args)
+            return await original(*args, **kwargs)
 
         queue = asyncio.Queue()
         with patch.object(self.service, "finish_execution", blocked_finish):

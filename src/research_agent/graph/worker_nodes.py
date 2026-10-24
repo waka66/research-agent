@@ -41,7 +41,7 @@ logger = logging.getLogger("research_agent/graph/worker_nodes.py")
 
 async def research_plan(state: ResearchWorkerState, config: RunnableConfig):
     """生成初始研究点和查询；已有研究点时跳过播种。"""
-    with node_log(
+    async with node_log(
         logger, "research_plan", state, config, round_number=state.get("round", 0)
     ) as record:
         task = state["task"]
@@ -95,7 +95,7 @@ MAX_ERROR_CALLS = 2  # 最大错误次数
 
 async def search_node(state: ResearchWorkerState, config: RunnableConfig):
     """并发搜索、合并来源，并记录本轮查询的执行状态与产出。"""
-    with node_log(
+    async with node_log(
         logger, "search_node", state, config, round_number=state.get("round", 0) + 1
     ) as record:
         record["query_errors"] = []
@@ -235,7 +235,7 @@ def _render_results(results) -> str:
 
 
 async def extract_node(state: ResearchWorkerState, config: RunnableConfig):
-    with node_log(
+    async with node_log(
         logger, "extract_node", state, config, round_number=state.get("round", 0) + 1
     ) as record:
         task = state["task"]
@@ -327,7 +327,7 @@ MAX_ROUNDS = 6  # 轮数硬上限
 
 
 async def update_node(state: ResearchWorkerState, config: RunnableConfig):
-    with node_log(
+    async with node_log(
         logger, "update_node", state, config, round_number=state.get("round", 0) + 1
     ) as record:
         points = {pid: point.model_copy() for pid, point in (state.get("points") or {}).items()}
@@ -370,7 +370,7 @@ MAX_TRIED_IN_PROMPT = 12
 
 
 async def plan_next(state: ResearchWorkerState, config: RunnableConfig):
-    with node_log(logger, "plan_next", state, config, round_number=state.get("round", 0)) as record:
+    async with node_log(logger, "plan_next", state, config, round_number=state.get("round", 0)) as record:
         task = state["task"]
         points = state.get("points") or {}
         findings = state.get("findings") or {}
@@ -474,7 +474,7 @@ async def plan_next(state: ResearchWorkerState, config: RunnableConfig):
 
 
 async def research_results(state: ResearchWorkerState, config: RunnableConfig):
-    with node_log(
+    async with node_log(
         logger, "research_results", state, config, round_number=state.get("round", 0)
     ) as record:
         task = state["task"]

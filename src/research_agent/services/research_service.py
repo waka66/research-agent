@@ -2,7 +2,9 @@ import asyncio
 import logging
 from uuid import UUID
 
+from research_agent.db import records as record_store
 from research_agent.db.history import finish_execution, mark_execution_running
+from research_agent.graph.observability import recording_execution
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +34,18 @@ async def finalize_execution(
     *,
     error: dict | None = None,
     data: dict | None = None,
+    records_complete: bool = True,
 ):
     """提交终态后通知 SSE；取消不打断正在提交的收尾。"""
 
     async def persist_and_notify():
         try:
-            changed = await finish_execution(execution_id, status, error)
+            changed = await finish_execution(
+                execution_id,
+                status,
+                error,
+                records_complete=records_complete,
+            )
         except Exception:
             logger.exception("无法保存 execution 终态：%s", execution_id)
             await queue.put(
@@ -102,28 +110,38 @@ async def _run_execution(
         "configurable": {"thread_id": str(run_id)},
         "metadata": {"execution_id": str(execution_id)},
     }
-    try:
-        await mark_execution_running(execution_id)
-        data = await _stream_updates(
-            agent,
-            inputs,
-            config,
-            queue,
-        )
-    except asyncio.CancelledError:
-        await finalize_execution(run_id, execution_id, queue, "cancelled")
-        raise
-    except Exception as exc:
-        logger.exception("研究执行失败：run_id=%s execution_id=%s", run_id, execution_id)
-        await finalize_execution(
-            run_id,
-            execution_id,
-            queue,
-            "failed",
-            error={"type": type(exc).__name__, "message": str(exc)},
-        )
-    else:
-        await finalize_execution(run_id, execution_id, queue, "completed", data=data)
+    with recording_execution(execution_id, record_store) as recording:
+        try:
+            await mark_execution_running(execution_id)
+            data = await _stream_updates(agent, inputs, config, queue)
+        except asyncio.CancelledError:
+            await finalize_execution(
+                run_id,
+                execution_id,
+                queue,
+                "cancelled",
+                records_complete=recording.records_complete,
+            )
+            raise
+        except Exception as exc:
+            logger.exception("研究执行失败：run_id=%s execution_id=%s", run_id, execution_id)
+            await finalize_execution(
+                run_id,
+                execution_id,
+                queue,
+                "failed",
+                error={"type": type(exc).__name__, "message": str(exc)},
+                records_complete=recording.records_complete,
+            )
+        else:
+            await finalize_execution(
+                run_id,
+                execution_id,
+                queue,
+                "completed",
+                data=data,
+                records_complete=recording.records_complete,
+            )
 
 
 async def research_status(agent, run_id: UUID):

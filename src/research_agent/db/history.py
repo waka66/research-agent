@@ -6,6 +6,7 @@ from sqlalchemy import select, update
 
 from research_agent.db.errors import ExecutionConflictError
 from research_agent.db.models import ResearchRun, RunExecution
+from research_agent.db.records import close_open_records
 from research_agent.db.session import SessionFactory
 
 
@@ -65,9 +66,12 @@ async def interrupt_active_executions(run_ids: set[UUID] | None = None) -> int:
                     "type": "ProcessInterrupted",
                     "message": "上一次服务进程退出，执行未正常结束",
                 },
+                records_complete=False,
             ).returning(RunExecution.execution_id)
         )
-        return len(result.scalars().all())
+        execution_ids = list(result.scalars().all())
+        await close_open_records(session, execution_ids, interrupted=True)
+        return len(execution_ids)
 
 
 async def create_start_execution(
@@ -116,6 +120,8 @@ async def finish_execution(
     execution_id: UUID,
     status: str,
     error: dict[str, Any] | None = None,
+    *,
+    records_complete: bool = True,
 ) -> bool:
     if status not in {"completed", "failed", "cancelled"}:
         raise ValueError(f"不支持的结束状态：{status}")
@@ -134,6 +140,7 @@ async def finish_execution(
             raise LookupError(f"execution 不存在：{execution_id}")
 
         if execution.status == status:
+            execution.records_complete = execution.records_complete and records_complete
             # 后台取消处理与取消接口可能同时收尾，只允许第一次发送终态事件。
             return False
 
@@ -146,6 +153,10 @@ async def finish_execution(
         execution.status = status
         execution.finished_at = datetime.now(UTC)
         execution.error = error
+        unclosed = await close_open_records(session, [execution_id], interrupted=False)
+        execution.records_complete = (
+            execution.records_complete and records_complete and not unclosed
+        )
         return True
 
 
@@ -168,6 +179,7 @@ async def get_execution(execution_id: UUID) -> dict | None:
             "started_at": execution.started_at,
             "finished_at": execution.finished_at,
             "error": execution.error,
+            "records_complete": execution.records_complete,
         }
 
 
@@ -195,4 +207,5 @@ async def get_latest_execution(run_id: UUID) -> dict | None:
             "started_at": execution.started_at,
             "finished_at": execution.finished_at,
             "error": execution.error,
+            "records_complete": execution.records_complete,
         }

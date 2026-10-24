@@ -34,6 +34,7 @@ database_url = make_url(settings.db_uri).set(
 MANAGED_TABLES = {
     "research_runs",
     "run_executions",
+    "execution_records",
 }
 
 

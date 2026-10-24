@@ -20,7 +20,7 @@ logger = logging.getLogger("research_agent/graph/main_nodes.py")
 
 async def Planner(state: ResearchState, config: RunnableConfig):
     """把研究问题拆分为独立任务；调用失败或解析失败直接向上传播。"""
-    with node_log(logger, "Planner", state, config) as record:
+    async with node_log(logger, "Planner", state, config) as record:
         planner_model = llm.with_structured_output(
             ResearchPlan,
             method="function_calling",
@@ -52,7 +52,7 @@ def dispatch_research_tasks(state: ResearchState):
 
 async def research_node(state: ResearcherInput, config: RunnableConfig):
     """运行一个研究子图；耗时包含该任务内所有搜索、提取和规划。"""
-    with node_log(logger, "research_node", state, config) as record:
+    async with node_log(logger, "research_node", state, config) as record:
         worker_result = await worker_graph.ainvoke(
             {
                 "task": state["task"],
@@ -117,7 +117,7 @@ def _evidence_block(result) -> tuple[str, int, int]:
 
 
 async def Synthesizer(state: ResearchState, config: RunnableConfig):
-    with node_log(logger, "Synthesizer", state, config) as record:
+    async with node_log(logger, "Synthesizer", state, config) as record:
         results = state["research_results"]
         findings_by_id = {f.id: f for r in results for f in r.findings}
         evidence_parts, thin, missing, contested = [], [], [], []
@@ -231,7 +231,7 @@ def _question_text(state) -> str:
 
 
 async def generator(state: ResearchState, config: RunnableConfig):
-    with node_log(logger, "generator", state, config) as record:
+    async with node_log(logger, "generator", state, config) as record:
         question = _question_text(state)
         results = state.get("research_results") or []
         report = state.get("report")
