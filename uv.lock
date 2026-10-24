@@ -1397,6 +1397,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "pyright" },
     { name = "ruff" },
 ]
@@ -1422,6 +1423,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pyright", specifier = ">=1.1.414" },
     { name = "ruff", specifier = ">=0.16.9" },
 ]

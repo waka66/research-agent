@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field, create_model
 from uuid import UUID
+from datetime import datetime
+from typing import Any
 from langchain.messages import AnyMessage
 from langgraph.graph import add_messages
 from typing_extensions import TypedDict, Literal
@@ -17,16 +19,23 @@ class ResearchRequest(BaseModel):
 
 class ResearchRunResponse(BaseModel):
     run_id: UUID
+    execution_id: UUID | None = None
     status: str
 
 class ResearchStatusResponse(BaseModel):
     run_id: UUID
+    execution_id: UUID
+    mode: str
     question: str
     status: str
-    plan: str
-    results: str
-    final_answer: str
-    error: str
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    checkpoint_available: bool = True
+    plan: "ResearchPlan | None" = None
+    results: "list[ResearchResult]" = Field(default_factory=list)
+    final_answer: str | None = None
+    error: dict[str, Any] | None = None
 
 
 
@@ -179,3 +188,5 @@ class ResearchResult(BaseModel):
     points: list[PointState]
     sources: list[Source]
 
+
+ResearchStatusResponse.model_rebuild()

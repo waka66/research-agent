@@ -1,12 +1,13 @@
-from fastapi import FastAPI
 from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from fastapi import Request
 
 from research_agent.config import settings
+from research_agent.db.session import engine
 from research_agent.graph.main_workflow import agent_builder
 
-DB_URI = (settings.db_uri)
+DB_URI = settings.db_uri
 
 
 @asynccontextmanager
@@ -21,7 +22,10 @@ async def lifespan(app: FastAPI):
         app.state.agent = agent
         app.state.checkpointer = checkpointer
 
-        yield
+        try:
+            yield
+        finally:
+            await engine.dispose()
 
 
 def get_agent(request: Request):

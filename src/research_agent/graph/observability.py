@@ -51,6 +51,7 @@ def node_log(logger, node_name: str, state, config: RunnableConfig, *, round_num
     """补充节点上下文；每次执行只输出一条结束记录。"""
     record = {
         "run_id": (config.get("configurable") or {}).get("thread_id"),
+        "execution_id": (config.get("metadata") or {}).get("execution_id"),
         "node_name": node_name,
     }
     task = state.get("task")
@@ -68,6 +69,7 @@ def tool_log(logger, tool_name: str, config: RunnableConfig):
     metadata = config.get("metadata") or {}
     record = {
         "run_id": (config.get("configurable") or {}).get("thread_id"),
+        "execution_id": metadata.get("execution_id"),
         "tool_name": tool_name,
         "task_id": metadata.get("research_task_id"),
         "round": metadata.get("research_round"),
