@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import FastAPI
 
+from research_agent.db.errors import ExecutionConflictError
 from research_agent.schemas.research import ResearchPlan
 
 ROOT = Path(__file__).resolve().parents[1] / "src/research_agent"
@@ -53,6 +54,21 @@ class MemoryHistory:
         assert row["status"] == "pending"
         row.update(status="running", started_at=datetime.now(UTC))
 
+    async def create_resume_execution(self, run_id, execution_id, expected_execution_id):
+        if self.create_error:
+            raise self.create_error
+        latest = await self.get_latest_execution(run_id)
+        if latest is None:
+            raise LookupError(run_id)
+        if latest["execution_id"] != expected_execution_id or latest["status"] not in {
+            "failed",
+            "cancelled",
+            "interrupted",
+        }:
+            raise ExecutionConflictError("执行状态已变化")
+        await self.create_start_execution(run_id, execution_id, latest["question"])
+        self.rows[execution_id]["mode"] = "resume"
+
     async def finish_execution(self, execution_id, status, error=None):
         if self.finish_error:
             raise self.finish_error
@@ -81,6 +97,8 @@ class FakeAgent:
         self.tail_failure = None
         self.snapshot_error = None
         self.snapshot = {"status": "running"}
+        self.checkpoint_id = "saved-checkpoint"
+        self.next_nodes = ("research_node",)
 
     async def astream(self, inputs, config, stream_mode):
         self.inputs, self.config = inputs, config
@@ -99,7 +117,11 @@ class FakeAgent:
     async def aget_state(self, config, subgraphs):
         if self.snapshot_error:
             raise self.snapshot_error
-        return SimpleNamespace(values=self.snapshot)
+        return SimpleNamespace(
+            values=self.snapshot,
+            config={"configurable": {"checkpoint_id": self.checkpoint_id}},
+            next=self.next_nodes,
+        )
 
 
 class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -109,6 +131,7 @@ class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         history_module = ModuleType("research_agent.db.history")
         for name in (
             "create_start_execution",
+            "create_resume_execution",
             "mark_execution_running",
             "finish_execution",
             "get_execution",
@@ -356,6 +379,139 @@ class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         while not queue.empty():
             events.append(queue.get_nowait()[0])
         self.assertEqual(events[-1], "completed")
+
+    async def failed_start(self):
+        self.agent.failure = TimeoutError("首次失败")
+        run_id, execution_id = await self.start()
+        await self.wait_finished(run_id)
+        self.agent.failure = None
+        return run_id, execution_id
+
+    async def test_resume_uses_database_without_memory_and_preserves_old_execution(self):
+        run_id, old_id = await self.failed_start()
+        old = await self.history.get_execution(old_id)
+        self.api.run_queues.clear()
+        self.api.runs.clear()
+        self.api.run_execution_ids.clear()
+        result = await self.client.post(f"/research/{run_id}/resume")
+        self.assertEqual(result.status_code, 202, result.text)
+        new_id = UUID(result.json()["execution_id"])
+        self.assertNotEqual(new_id, old_id)
+        self.assertEqual(result.json()["run_id"], str(run_id))
+        await self.wait_finished(run_id)
+        self.assertEqual(await self.history.get_execution(old_id), old)
+        new = await self.history.get_execution(new_id)
+        self.assertEqual((new["mode"], new["status"]), ("resume", "completed"))
+        self.assertIsNone(self.agent.inputs)
+        self.assertEqual(self.agent.config["configurable"]["thread_id"], str(run_id))
+        self.assertEqual(self.agent.config["metadata"]["execution_id"], str(new_id))
+        self.assertEqual((await self.events(run_id))[-1][1]["execution_id"], str(new_id))
+        status = (await self.client.get(f"/research/{run_id}")).json()
+        self.assertEqual((status["mode"], status["execution_id"]), ("resume", str(new_id)))
+
+    async def test_resume_missing_run_and_non_resumable_statuses(self):
+        self.assertEqual(
+            (await self.client.post(f"/research/{uuid4()}/resume")).status_code,
+            404,
+        )
+        run_id, _ = await self.start()
+        await self.wait_finished(run_id)
+        self.assertEqual(
+            (await self.client.post(f"/research/{run_id}/resume")).status_code,
+            409,
+        )
+        run_id, execution_id = uuid4(), uuid4()
+        await self.history.create_start_execution(run_id, execution_id, "未完成")
+        for status in ("pending", "running"):
+            self.history.rows[execution_id]["status"] = status
+            self.assertEqual(
+                (await self.client.post(f"/research/{run_id}/resume")).status_code,
+                409,
+            )
+
+    async def test_resume_checks_saved_checkpoint_and_pending_nodes(self):
+        run_id, _ = await self.failed_start()
+        self.agent.checkpoint_id = None
+        result = await self.client.post(f"/research/{run_id}/resume")
+        self.assertEqual(result.status_code, 409)
+        self.assertIn("没有已保存", result.json()["detail"])
+        self.agent.checkpoint_id = "saved"
+        self.agent.next_nodes = ()
+        result = await self.client.post(f"/research/{run_id}/resume")
+        self.assertEqual(result.status_code, 409)
+        self.assertIn("没有待执行", result.json()["detail"])
+        self.assertEqual(len(self.history.rows), 1)
+
+    async def test_resume_checkpoint_failure_and_database_failure_do_not_create_task(self):
+        run_id, old_id = await self.failed_start()
+        old_task = self.api.runs[run_id]
+        self.agent.snapshot_error = ConnectionError("检查点不可用")
+        self.assertEqual(
+            (await self.client.post(f"/research/{run_id}/resume")).status_code,
+            503,
+        )
+        self.agent.snapshot_error = None
+        self.history.create_error = ConnectionError("数据库不可用")
+        self.assertEqual(
+            (await self.client.post(f"/research/{run_id}/resume")).status_code,
+            503,
+        )
+        self.assertIs(self.api.runs[run_id], old_task)
+        self.assertEqual(list(self.history.rows), [old_id])
+
+    async def test_resume_state_changed_during_checkpoint_read_returns_conflict(self):
+        run_id, _ = await self.failed_start()
+
+        async def conflict(*args):
+            raise ExecutionConflictError("执行记录已变化")
+
+        with patch.object(self.api, "create_resume_execution", conflict):
+            result = await self.client.post(f"/research/{run_id}/resume")
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(len(self.history.rows), 1)
+
+    async def test_concurrent_resume_accepts_only_one_and_creates_fresh_queue(self):
+        run_id, _ = await self.failed_start()
+        old_queue = self.api.run_queues[run_id]
+        self.agent.gate = asyncio.Event()
+        results = await asyncio.gather(
+            *(self.client.post(f"/research/{run_id}/resume") for _ in range(2)),
+        )
+        self.assertEqual(sorted(result.status_code for result in results), [202, 409])
+        self.assertEqual(len(self.history.rows), 2)
+        self.assertIsNot(self.api.run_queues[run_id], old_queue)
+        result = await self.client.post(f"/research/{run_id}/cancel")
+        self.assertEqual(result.json()["status"], "cancelled")
+        latest = await self.history.get_latest_execution(run_id)
+        self.assertEqual((latest["mode"], latest["status"]), ("resume", "cancelled"))
+
+    async def test_failed_resume_can_be_resumed_again(self):
+        run_id, old_id = await self.failed_start()
+        self.agent.failure = ValueError("恢复仍失败")
+        result = await self.client.post(f"/research/{run_id}/resume")
+        first_resume = UUID(result.json()["execution_id"])
+        await self.wait_finished(run_id)
+        self.assertEqual(self.history.rows[first_resume]["status"], "failed")
+        self.agent.failure = None
+        result = await self.client.post(f"/research/{run_id}/resume")
+        second_resume = UUID(result.json()["execution_id"])
+        await self.wait_finished(run_id)
+        self.assertEqual(self.history.rows[second_resume]["status"], "completed")
+        self.assertEqual(self.history.rows[old_id]["status"], "failed")
+        self.assertEqual(len(self.history.rows), 3)
+
+    async def test_interrupted_execution_can_resume_and_shutdown_cancels_new_execution(self):
+        run_id, old_id = await self.failed_start()
+        self.history.rows[old_id]["status"] = "interrupted"
+        self.api.runs.clear()
+        self.api.run_queues.clear()
+        self.agent.gate = asyncio.Event()
+        result = await self.client.post(f"/research/{run_id}/resume")
+        new_id = UUID(result.json()["execution_id"])
+        await self.api.shutdown_research_tasks()
+        self.assertTrue(self.api.runs[run_id].done())
+        self.assertEqual(self.history.rows[new_id]["status"], "cancelled")
+        self.assertEqual(self.history.rows[old_id]["status"], "interrupted")
 
 
 if __name__ == "__main__":

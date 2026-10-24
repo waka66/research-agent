@@ -19,7 +19,7 @@ class ResearchRequest(BaseModel):
 
 class ResearchRunResponse(BaseModel):
     run_id: UUID
-    execution_id: UUID | None = None
+    execution_id: UUID
     status: str
 
 class ResearchStatusResponse(BaseModel):

@@ -11,6 +11,7 @@ logging.basicConfig(
 )
 
 app = FastAPI(lifespan=lifespan)
+app.state.shutdown_research = research.shutdown_research_tasks
 
 # CORS 中间件,
 app.add_middleware(

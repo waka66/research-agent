@@ -61,6 +61,12 @@ class RunExecution(Base):
             "run_id",
             "created_at",
         ),
+        Index(
+            "uq_run_executions_active_run",
+            "run_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
     )
 
     execution_id: Mapped[UUID] = mapped_column(

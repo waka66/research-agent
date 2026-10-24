@@ -91,11 +91,11 @@ async def _stream_updates(agent, inputs, config, queue):
     return final_data
 
 
-async def run_research(
+async def _run_execution(
     agent,
     run_id: UUID,
     execution_id: UUID,
-    question: str,
+    inputs: dict | None,
     queue: asyncio.Queue,
 ):
     config = {
@@ -106,7 +106,7 @@ async def run_research(
         await mark_execution_running(execution_id)
         data = await _stream_updates(
             agent,
-            {"question": question, "status": "running"},
+            inputs,
             config,
             queue,
         )
@@ -133,29 +133,22 @@ async def research_status(agent, run_id: UUID):
     )
 
 
-async def run_resume(agent, run_id: UUID, queue: asyncio.Queue):
-    """兼容旧恢复入口；新建 resume execution 在下一阶段接入。"""
-    try:
-        data = await _stream_updates(
-            agent,
-            None,
-            {"configurable": {"thread_id": str(run_id)}},
-            queue,
-        )
-        await queue.put(("completed", data))
-    except asyncio.CancelledError:
-        await queue.put(("cancelled", None))
-        raise
-    except Exception as exc:
-        logger.exception("旧恢复流程失败：%s", run_id)
-        await queue.put(
-            (
-                "failed",
-                {
-                    "error": {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
-                },
-            )
-        )
+async def run_research(
+    agent,
+    run_id: UUID,
+    execution_id: UUID,
+    question: str,
+    queue: asyncio.Queue,
+):
+    await _run_execution(
+        agent,
+        run_id,
+        execution_id,
+        {"question": question, "status": "running"},
+        queue,
+    )
+
+
+async def run_resume(agent, run_id: UUID, execution_id: UUID, queue: asyncio.Queue):
+    # None 表示从同一 thread 的未完成检查点继续，而非重新提交 question。
+    await _run_execution(agent, run_id, execution_id, None, queue)
