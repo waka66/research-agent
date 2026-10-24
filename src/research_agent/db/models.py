@@ -115,6 +115,11 @@ class RunExecution(Base):
         server_default=text("true"),
     )
 
+    result_summary: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
+
 
 class ExecutionRecord(Base):
     """一次节点/工具调用；细节保留原始 record，检索字段单独成列。"""

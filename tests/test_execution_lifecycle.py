@@ -48,6 +48,7 @@ class MemoryHistory:
             "finished_at": None,
             "error": None,
             "records_complete": True,
+            "result_summary": None,
         }
 
     async def mark_execution_running(self, execution_id):
@@ -70,7 +71,15 @@ class MemoryHistory:
         await self.create_start_execution(run_id, execution_id, latest["question"])
         self.rows[execution_id]["mode"] = "resume"
 
-    async def finish_execution(self, execution_id, status, error=None, *, records_complete=True):
+    async def finish_execution(
+        self,
+        execution_id,
+        status,
+        error=None,
+        *,
+        records_complete=True,
+        result_summary=None,
+    ):
         if self.finish_error:
             raise self.finish_error
         row = self.rows[execution_id]
@@ -79,6 +88,7 @@ class MemoryHistory:
             return False
         assert row["status"] in {"pending", "running"}
         row.update(status=status, error=error, finished_at=datetime.now(UTC))
+        row["result_summary"] = deepcopy(result_summary)
         return True
 
     async def get_execution(self, execution_id):
@@ -131,6 +141,7 @@ class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # patch.dict(sys.modules) 会移除范围内新导入的模块；提前加载，避免数据库测试
         # 随后加载另一套 SQLAlchemy PostgreSQL 类型，破坏 JSONB 参数推断。
         self.record_store = importlib.import_module("research_agent.db.records")
+        self.snapshot_module = importlib.import_module("research_agent.services.result_snapshot")
         self.history = MemoryHistory()
         self.agent = FakeAgent()
         history_module = ModuleType("research_agent.db.history")
@@ -391,6 +402,53 @@ class ExecutionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_finished(run_id)
         self.agent.failure = None
         return run_id, execution_id
+
+    async def test_snapshot_is_saved_before_terminal_event_and_does_not_follow_later_state(self):
+        self.agent.snapshot = {"final_answer": "首次成果", "report": None}
+        run_id, execution_id = await self.start()
+        await self.wait_finished(run_id)
+        summary = self.history.rows[execution_id]["result_summary"]
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["markdown_chars"], 4)
+        self.assertEqual(summary["render_mode"], "evidence_only")
+        self.agent.snapshot = {"final_answer": "后来恢复产生了不同的成果"}
+        self.assertEqual(self.history.rows[execution_id]["result_summary"], summary)
+        self.assertEqual((await self.events(run_id))[-1][0], "completed")
+
+    async def test_snapshot_failure_preserves_original_execution_failure(self):
+        self.agent.failure = TimeoutError("原始模型超时")
+        self.agent.snapshot_error = ConnectionError("检查点暂时不可用")
+        with patch.object(self.snapshot_module.logger, "exception"):
+            run_id, execution_id = await self.start()
+            await self.wait_finished(run_id)
+        row = self.history.rows[execution_id]
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error"], {"type": "TimeoutError", "message": "原始模型超时"})
+        self.assertEqual(row["result_summary"]["reason"], "checkpoint_unavailable")
+        self.assertTrue(row["records_complete"])
+
+    async def test_repeated_cancel_during_snapshot_waits_for_snapshot_and_terminal_commit(self):
+        self.agent.gate = asyncio.Event()
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = self.agent.aget_state
+
+        async def blocked(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        with patch.object(self.agent, "aget_state", blocked):
+            run_id, execution_id = await self.start()
+            await self.agent.started.wait()
+            request = asyncio.create_task(self.client.post(f"/research/{run_id}/cancel"))
+            await entered.wait()
+            self.api.runs[run_id].cancel()
+            await asyncio.sleep(0)
+            self.api.runs[run_id].cancel()
+            release.set()
+            result = await asyncio.wait_for(request, timeout=2)
+        self.assertEqual(result.json()["status"], "cancelled")
+        self.assertTrue(self.history.rows[execution_id]["result_summary"]["available"])
 
     async def test_resume_uses_database_without_memory_and_preserves_old_execution(self):
         run_id, old_id = await self.failed_start()

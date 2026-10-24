@@ -5,6 +5,7 @@ from uuid import UUID
 from research_agent.db import records as record_store
 from research_agent.db.history import finish_execution, mark_execution_running
 from research_agent.graph.observability import recording_execution
+from research_agent.services.result_snapshot import capture_result_summary
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +36,19 @@ async def finalize_execution(
     error: dict | None = None,
     data: dict | None = None,
     records_complete: bool = True,
+    agent=None,
 ):
     """提交终态后通知 SSE；取消不打断正在提交的收尾。"""
 
     async def persist_and_notify():
+        result_summary = await capture_result_summary(agent, run_id)
         try:
             changed = await finish_execution(
                 execution_id,
                 status,
                 error,
                 records_complete=records_complete,
+                result_summary=result_summary,
             )
         except Exception:
             logger.exception("无法保存 execution 终态：%s", execution_id)
@@ -78,11 +82,19 @@ async def finalize_execution(
             )
 
     finalizer = asyncio.create_task(persist_and_notify())
-    try:
-        await asyncio.shield(finalizer)
-    except asyncio.CancelledError:
-        await finalizer
-        raise
+    cancelled = False
+    while not finalizer.done():
+        try:
+            await asyncio.shield(finalizer)
+        except asyncio.CancelledError:
+            if finalizer.cancelled():
+                break
+            cancelled = True
+        except Exception:
+            break
+    finalizer.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 async def _stream_updates(agent, inputs, config, queue):
@@ -121,6 +133,7 @@ async def _run_execution(
                 queue,
                 "cancelled",
                 records_complete=recording.records_complete,
+                agent=agent,
             )
             raise
         except Exception as exc:
@@ -132,6 +145,7 @@ async def _run_execution(
                 "failed",
                 error={"type": type(exc).__name__, "message": str(exc)},
                 records_complete=recording.records_complete,
+                agent=agent,
             )
         else:
             await finalize_execution(
@@ -141,6 +155,7 @@ async def _run_execution(
                 "completed",
                 data=data,
                 records_complete=recording.records_complete,
+                agent=agent,
             )
 
 

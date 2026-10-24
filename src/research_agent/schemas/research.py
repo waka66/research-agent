@@ -33,6 +33,7 @@ class ResearchStatusResponse(BaseModel):
     finished_at: datetime | None = None
     checkpoint_available: bool = True
     records_complete: bool
+    result_summary: dict[str, Any] | None = None
     plan: "ResearchPlan | None" = None
     results: "list[ResearchResult]" = Field(default_factory=list)
     final_answer: str | None = None

@@ -4,12 +4,46 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import bindparam, update
+from sqlalchemy import bindparam, select, tuple_, update
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from research_agent.db.models import ExecutionRecord
 from research_agent.db.session import SessionFactory
+
+
+async def list_records(
+    execution_id: UUID,
+    *,
+    limit: int,
+    after: tuple[datetime, UUID] | None = None,
+    kind: str | None = None,
+    status: str | None = None,
+    name: str | None = None,
+    task_id: str | None = None,
+    round_number: int | None = None,
+) -> list[ExecutionRecord]:
+    """按发生顺序读取 limit+1 条；父记录可在其他页，筛选只作用于行本身。"""
+    statement = select(ExecutionRecord).where(ExecutionRecord.execution_id == execution_id)
+    for column, value in (
+        (ExecutionRecord.kind, kind),
+        (ExecutionRecord.status, status),
+        (ExecutionRecord.name, name),
+        (ExecutionRecord.task_id, task_id),
+        (ExecutionRecord.round, round_number),
+    ):
+        if value is not None:
+            statement = statement.where(column == value)
+    if after is not None:
+        statement = statement.where(
+            tuple_(ExecutionRecord.started_at, ExecutionRecord.record_id) > after,
+        )
+    statement = statement.order_by(
+        ExecutionRecord.started_at,
+        ExecutionRecord.record_id,
+    ).limit(limit + 1)
+    async with SessionFactory() as session:
+        return list((await session.scalars(statement)).all())
 
 
 async def start_record(record: dict) -> None:

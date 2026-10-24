@@ -2,12 +2,35 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, tuple_, update
 
 from research_agent.db.errors import ExecutionConflictError
-from research_agent.db.models import ResearchRun, RunExecution
+from research_agent.db.models import ExecutionRecord, ResearchRun, RunExecution
 from research_agent.db.records import close_open_records
 from research_agent.db.session import SessionFactory
+from research_agent.schemas.summary import unavailable_summary
+
+
+async def list_executions(
+    run_id: UUID,
+    *,
+    limit: int,
+    before: tuple[datetime, UUID] | None = None,
+) -> list[RunExecution] | None:
+    """最新执行在前，读取 limit+1 行供接口判断下一页；None 表示研究不存在。"""
+    statement = select(RunExecution).where(RunExecution.run_id == run_id)
+    if before is not None:
+        statement = statement.where(
+            tuple_(RunExecution.created_at, RunExecution.execution_id) < before,
+        )
+    statement = statement.order_by(
+        RunExecution.created_at.desc(),
+        RunExecution.execution_id.desc(),
+    ).limit(limit + 1)
+    async with SessionFactory() as session:
+        if await session.get(ResearchRun, run_id) is None:
+            return None
+        return list((await session.scalars(statement)).all())
 
 
 async def create_resume_execution(
@@ -67,6 +90,7 @@ async def interrupt_active_executions(run_ids: set[UUID] | None = None) -> int:
                     "message": "上一次服务进程退出，执行未正常结束",
                 },
                 records_complete=False,
+                result_summary=unavailable_summary("process_interrupted"),
             ).returning(RunExecution.execution_id)
         )
         execution_ids = list(result.scalars().all())
@@ -122,6 +146,7 @@ async def finish_execution(
     error: dict[str, Any] | None = None,
     *,
     records_complete: bool = True,
+    result_summary: dict | None = None,
 ) -> bool:
     if status not in {"completed", "failed", "cancelled"}:
         raise ValueError(f"不支持的结束状态：{status}")
@@ -153,11 +178,50 @@ async def finish_execution(
         execution.status = status
         execution.finished_at = datetime.now(UTC)
         execution.error = error
+        execution.result_summary = result_summary
         unclosed = await close_open_records(session, [execution_id], interrupted=False)
         execution.records_complete = (
             execution.records_complete and records_complete and not unclosed
         )
         return True
+
+
+def _execution_dict(execution: RunExecution) -> dict:
+    return {
+        key: getattr(execution, key)
+        for key in (
+            "execution_id",
+            "run_id",
+            "mode",
+            "status",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "error",
+            "records_complete",
+            "result_summary",
+        )
+    }
+
+
+async def load_execution_report(execution_id: UUID) -> tuple[dict, list[dict]] | None:
+    """同一只读数据库快照读取执行与全部记录，不复用明细接口的分页上限。"""
+    async with SessionFactory.begin() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        execution = await session.get(RunExecution, execution_id)
+        if execution is None:
+            return None
+        rows = (
+            await session.scalars(
+                select(ExecutionRecord)
+                .where(ExecutionRecord.execution_id == execution_id)
+                .order_by(ExecutionRecord.started_at, ExecutionRecord.record_id),
+            )
+        ).all()
+        return _execution_dict(execution), [
+            {column.name: getattr(row, column.name) for column in ExecutionRecord.__table__.columns}
+            for row in rows
+        ]
 
 
 async def get_execution(execution_id: UUID) -> dict | None:
@@ -170,17 +234,7 @@ async def get_execution(execution_id: UUID) -> dict | None:
         if execution is None:
             return None
 
-        return {
-            "execution_id": execution.execution_id,
-            "run_id": execution.run_id,
-            "mode": execution.mode,
-            "status": execution.status,
-            "created_at": execution.created_at,
-            "started_at": execution.started_at,
-            "finished_at": execution.finished_at,
-            "error": execution.error,
-            "records_complete": execution.records_complete,
-        }
+        return _execution_dict(execution)
 
 
 async def get_latest_execution(run_id: UUID) -> dict | None:
@@ -197,15 +251,4 @@ async def get_latest_execution(run_id: UUID) -> dict | None:
         if row is None:
             return None
         question, execution = row
-        return {
-            "question": question,
-            "execution_id": execution.execution_id,
-            "run_id": execution.run_id,
-            "mode": execution.mode,
-            "status": execution.status,
-            "created_at": execution.created_at,
-            "started_at": execution.started_at,
-            "finished_at": execution.finished_at,
-            "error": execution.error,
-            "records_complete": execution.records_complete,
-        }
+        return {"question": question, **_execution_dict(execution)}

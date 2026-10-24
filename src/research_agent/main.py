@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 import logging
 
-from research_agent.api import research
+from research_agent.api import executions, research
 from research_agent.graph.agent import lifespan
 
 logging.basicConfig(
@@ -27,3 +27,4 @@ async def root():
 
 
 app.include_router(research.router)
+app.include_router(executions.router)
